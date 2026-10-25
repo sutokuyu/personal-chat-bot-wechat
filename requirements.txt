@@ -1,0 +1,14 @@
+# Runtime dependencies (Python 3.11+ recommended; Windows for wxauto)
+langchain>=1.4,<2
+langchain-deepseek>=1.1,<2
+pydantic>=2.14,<3
+PyYAML>=6.0,<7
+python-dotenv>=1.2,<2
+
+# wxauto 3.9.x is Windows-only and drives the desktop WeChat 3.9.x client.
+# The marker keeps the core test suite installable on Linux.
+wxauto>=3.9.11,<4; sys_platform == "win32"
+
+# Test dependencies
+pytest>=9.0,<10
+pytest-asyncio>=1.4,<2

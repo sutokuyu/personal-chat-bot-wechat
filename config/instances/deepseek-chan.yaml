@@ -1,0 +1,80 @@
+instance_id: deepseek-chan
+persona_id: deepseek-chan
+database_path: ./data/bot.db
+
+wechat:
+  # Single WeChat account. Used to namespace local data and state.
+  account_id: wechat-main
+
+  # Chats to monitor. Use the exact chat name shown in WeChat.
+  # kind=direct: every message is addressed to the bot.
+  # kind=group: the bot only treats @mentions as direct; other messages go
+  # through the participation gate.
+  chats:
+    - name: "文件传输助手"
+      kind: direct
+    # - name: "一个群聊名称"
+    #   kind: group
+
+  poll_interval_seconds: 1.0
+  send_delay_seconds: 1.0
+  # Optional. If omitted, the logged-in WeChat nickname is used for @ detection.
+  bot_name: null
+  text_only: true
+
+tools:
+  - search_memory
+  - get_user_profile
+
+model:
+  provider: deepseek
+  model_name: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  temperature: 0.9
+  timeout_seconds: 60
+  max_retries: 2
+
+memory:
+  enabled: true
+  allow_shared_memory: false
+  extraction_threshold: 10
+  extraction_batch_size: 18
+  extraction_max_attempts: 3
+  extraction_timeout_seconds: 90
+  max_memories_per_search: 5
+  max_memory_chars: 500
+  min_importance: 0.35
+  min_confidence: 0.45
+
+agent:
+  max_tool_rounds: 3
+  timeout_seconds: 120
+
+reply:
+  mention_priority: true
+  channel_cooldown_seconds: 5
+  user_cooldown_seconds: 3
+  continuation_window_seconds: 180
+  continuation_channel_cooldown_seconds: 2
+  continuation_user_cooldown_seconds: 1
+  max_reply_length: 1800
+  # Single account: no cross-instance claim is needed.
+  claim_message_across_instances: false
+  message_claim_ttl_seconds: 120
+
+context:
+  max_messages: 30
+  merge_window_seconds: 3
+
+participation:
+  enabled: true
+  reply_probability: 0.35
+  ignore_other_mentions: true
+  # WeChat cannot reliably distinguish bots from humans; these options are
+  # retained for future use and currently have no practical effect.
+  reply_to_other_bots: false
+  bot_reply_probability: 0.1
+  allow_consecutive_bot_messages: false
+  max_context_messages: 15
+  timeout_seconds: 30
+  default_reply_on_error: false
