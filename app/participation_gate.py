@@ -38,11 +38,19 @@ class GateDecision:
     should_reply: bool
     reason: str
     forced: bool = False
+    # Seconds until a cooldown-blocked message may be judged again. 0 means
+    # "do not retry"; the runtime turns this into a single delayed retry so a
+    # chatty user cannot permanently starve everyone else in the channel.
+    retry_after: float = 0.0
 
 
 class ParticipationJudge(Protocol):
     async def judge(
-        self, transcript: str, current: IncomingMessage
+        self,
+        transcript: str,
+        current: IncomingMessage,
+        *,
+        image_context: str = "",
     ) -> ParticipationDecision: ...
 
 
@@ -90,10 +98,14 @@ class LLMParticipationJudge:
             self._structured = None
 
     async def judge(
-        self, transcript: str, current: IncomingMessage
+        self,
+        transcript: str,
+        current: IncomingMessage,
+        *,
+        image_context: str = "",
     ) -> ParticipationDecision:
         system, user = build_participation_prompt(
-            self.persona_prompt, transcript, current
+            self.persona_prompt, transcript, current, image_context=image_context
         )
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
         try:
@@ -247,7 +259,12 @@ class ParticipationGate:
         return True
 
     async def evaluate(
-        self, message: IncomingMessage, *, recent: list[IncomingMessage]
+        self,
+        message: IncomingMessage,
+        *,
+        recent: list[IncomingMessage],
+        reprocess: bool = False,
+        image_context: str = "",
     ) -> GateDecision:
         if message.author_id <= 0:
             return GateDecision(False, "author has no valid id")
@@ -255,7 +272,7 @@ class ParticipationGate:
             return GateDecision(False, "author is a bot without explicit opt-in")
         if not self.allowed_location(message):
             return GateDecision(False, "guild/channel not allowed for this instance")
-        if not self.context.mark_seen(message.message_id):
+        if not reprocess and not self.context.mark_seen(message.message_id):
             return GateDecision(False, "duplicate message id")
         if not message.content.strip():
             return GateDecision(False, "empty message")
@@ -298,14 +315,22 @@ class ParticipationGate:
             channel_cooldown,
         )
         if channel_wait > 0:
-            return GateDecision(False, f"channel cooldown ({channel_wait:.1f}s left)")
+            return GateDecision(
+                False,
+                f"channel cooldown ({channel_wait:.1f}s left)",
+                retry_after=channel_wait,
+            )
         user_wait = await asyncio.to_thread(
             self.cooldowns.user_remaining,
             message,
             user_cooldown,
         )
         if user_wait > 0:
-            return GateDecision(False, f"user cooldown ({user_wait:.1f}s left)")
+            return GateDecision(
+                False,
+                f"user cooldown ({user_wait:.1f}s left)",
+                retry_after=user_wait,
+            )
 
         if message.is_mention and self.reply.mention_priority:
             return GateDecision(True, "direct mention", forced=True)
@@ -325,7 +350,9 @@ class ParticipationGate:
         transcript = render_transcript(
             limited, merge_window_seconds=self.merge_window_seconds
         )
-        decision = await self.judge.judge(transcript, message)
+        decision = await self.judge.judge(
+            transcript, message, image_context=image_context
+        )
         if not decision.should_reply:
             return GateDecision(False, decision.reason or "model decision")
 

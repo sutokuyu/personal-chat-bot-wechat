@@ -24,6 +24,7 @@ from app.agent.prompts import build_system_prompt
 from app.config import AgentConfig, ModelConfig
 from app.errors import AgentExecutionError, AgentTimeoutError, AgentToolLimitError
 from app.tools.context import AgentRuntimeContext
+from app.vision import image_content_block
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ class AgentFactory:
         input_text: str,
         *,
         context: AgentRuntimeContext,
+        images: list[str] | None = None,
         timeout_seconds: float | None = None,
     ) -> AgentResult:
         timeout = timeout_seconds or self.config.timeout_seconds
@@ -104,9 +106,19 @@ class AgentFactory:
             context.user_id,
         )
         try:
+            content: str | list[dict] = input_text
+            if images:
+                blocks: list[dict] = [{"type": "text", "text": input_text}]
+                for path in images:
+                    block = image_content_block(path)
+                    if block is not None:
+                        blocks.append(block)
+                if len(blocks) > 1:
+                    content = blocks
+
             result = await asyncio.wait_for(
                 self.agent.ainvoke(
-                    {"messages": [{"role": "user", "content": input_text}]},
+                    {"messages": [{"role": "user", "content": content}]},
                     context=context,
                     config={"recursion_limit": 2 * self.config.max_tool_rounds + 6},
                 ),

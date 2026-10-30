@@ -52,6 +52,8 @@ class ModelConfig(StrictModel):
 class WeChatChatConfig(StrictModel):
     name: str = Field(min_length=1, max_length=100)
     kind: Literal["direct", "group"] = "group"
+    # Per-chat override for wechat.image_cache_size.
+    image_cache_size: int | None = Field(default=None, ge=0, le=50)
 
 
 class WeChatConfig(StrictModel):
@@ -63,6 +65,16 @@ class WeChatConfig(StrictModel):
     send_delay_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
     bot_name: str | None = Field(default=None, max_length=100)
     text_only: bool = True
+    # Download image messages and let the bot look at them. Other non-text
+    # message types are still skipped.
+    capture_images: bool = False
+    # How long a captured image stays available for follow-up messages such as
+    # "这张图里是什么". 0 deletes images as soon as they are handled.
+    image_followup_seconds: float = Field(default=120.0, ge=0.0, le=900.0)
+    # How many images to keep per chat (FIFO). Chats can override this.
+    image_cache_size: int = Field(default=10, ge=0, le=50)
+    # How many cached images to attach to one follow-up message.
+    image_followup_max_images: int = Field(default=3, ge=1, le=6)
 
     @field_validator("chats")
     @classmethod
@@ -70,6 +82,30 @@ class WeChatConfig(StrictModel):
         names = [chat.name for chat in value]
         if len(set(names)) != len(names):
             raise ValueError("wechat.chats names must be unique")
+        return value
+
+
+class WebSearchConfig(StrictModel):
+    """DeepSeek Search API settings for the ``web_search`` tool."""
+
+    max_results: int = Field(default=5, ge=1, le=10)
+    timeout_seconds: float = Field(default=10.0, gt=0.0, le=60.0)
+    include_content: bool = False
+    api_base: str = Field(default="https://api.deepseek.com", min_length=1, max_length=200)
+    api_key_env: str = Field(default="DEEPSEEK_API_KEY", min_length=1, max_length=100)
+
+    @field_validator("api_base")
+    @classmethod
+    def _valid_api_base(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("api_base must start with http:// or https://")
+        return value.rstrip("/")
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _valid_api_key_env(cls, value: str) -> str:
+        if not _ENV_RE.match(value):
+            raise ValueError("api_key_env must be a valid environment variable name")
         return value
 
 
@@ -110,6 +146,10 @@ class ReplyConfig(StrictModel):
     continuation_window_seconds: float = Field(default=0.0, ge=0.0, le=3600.0)
     continuation_channel_cooldown_seconds: float = Field(default=2.0, ge=0.0, le=300.0)
     continuation_user_cooldown_seconds: float = Field(default=1.0, ge=0.0, le=300.0)
+    # A message dropped only because of a cooldown is judged once more after the
+    # cooldown expires, so one chatty user cannot starve the rest of the chat.
+    retry_on_cooldown: bool = True
+    max_cooldown_retry_seconds: float = Field(default=15.0, ge=0.0, le=300.0)
     empty_reply_fallback: str = Field(
         default="（不知道该说什么……先听你们聊。）",
         max_length=200,
@@ -147,6 +187,7 @@ class InstanceConfig(StrictModel):
     tools: list[str] = Field(default_factory=lambda: ["search_memory", "get_user_profile"])
     model: ModelConfig = Field(default_factory=ModelConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)

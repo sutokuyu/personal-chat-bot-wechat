@@ -31,6 +31,9 @@ class IncomingMessage:
     mentions_other: bool = False
     is_bot: bool = False
     is_self: bool = False
+    # Local files downloaded for this message. They only live for the duration
+    # of one handling pass and are deleted afterwards.
+    image_paths: tuple[str, ...] = ()
 
     @property
     def key(self) -> ChannelKey:

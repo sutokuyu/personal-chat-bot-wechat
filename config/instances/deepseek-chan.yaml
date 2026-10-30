@@ -11,20 +11,35 @@ wechat:
   # kind=group: the bot only treats @mentions as direct; other messages go
   # through the participation gate.
   chats:
-    - name: "文件传输助手"
-      kind: direct
-    # - name: "一个群聊名称"
-    #   kind: group
+    - name: "我的朋友很少"
+      kind: group
+    - name: "老窝🌹🍎🍑💖"
+      kind: group
+    - name: "小窝儿 🎵 🎵 🎵"
+      kind: group
+      # 可以单独给某个群设置图片缓存数量（不写就用下面的全局值）
+      # image_cache_size: 20
 
   poll_interval_seconds: 1.0
   send_delay_seconds: 1.0
   # Optional. If omitted, the logged-in WeChat nickname is used for @ detection.
   bot_name: null
   text_only: true
+  # 下载并识别图片：先让视觉模型生成一句描述给参与判断，原图再随消息交给 Agent。
+  # 其他非文本类型（语音/文件/视频）仍然跳过。
+  capture_images: true
+  # 图片 FIFO 缓存：每个聊天保留最近这么多张图（先进先出，满了删最旧的）。
+  # 0 = 不缓存。单个聊天可以用 chats[].image_cache_size 覆盖。
+  image_cache_size: 10
+  # 一次追问最多把几张缓存原图附给模型（其余图片只给「发送者+时间+图注」）。
+  image_followup_max_images: 3
+  # 缓存有效期（秒）：超过这个时间的图会被清掉，只能靠当时的文字描述。
+  image_followup_seconds: 120
 
 tools:
   - search_memory
   - get_user_profile
+  - web_search
 
 model:
   provider: deepseek
@@ -33,6 +48,15 @@ model:
   temperature: 0.9
   timeout_seconds: 60
   max_retries: 2
+
+# 联网搜索（DeepSeek 官方 Search API，与模型共用同一个 key）。
+# 按请求计费（$0.75 / 1000 次），不需要额外申请；从 tools 里删掉 web_search 即可关闭。
+web_search:
+  max_results: 5
+  timeout_seconds: 10
+  include_content: false
+  api_base: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
 
 memory:
   enabled: true
@@ -57,6 +81,10 @@ reply:
   continuation_window_seconds: 180
   continuation_channel_cooldown_seconds: 2
   continuation_user_cooldown_seconds: 1
+  # 被冷却挡下的消息在冷却结束后再判断一次（只重试一次），
+  # 避免某个人一直在聊，其他人插话时永远被冷却丢掉。
+  retry_on_cooldown: true
+  max_cooldown_retry_seconds: 15
   max_reply_length: 1800
   # Single account: no cross-instance claim is needed.
   claim_message_across_instances: false
@@ -68,7 +96,9 @@ context:
 
 participation:
   enabled: true
-  reply_probability: 0.35
+  # 判断器通过后再掷一次骰子；1.0 = 完全交给判断器决定（推荐起始值）。
+  # 调到 0.35 这类低值会把 judge 认可的消息再砍掉 65%，看起来就像「不 @ 不说话」。
+  reply_probability: 1.0
   ignore_other_mentions: true
   # WeChat cannot reliably distinguish bots from humans; these options are
   # retained for future use and currently have no practical effect.

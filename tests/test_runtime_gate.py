@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from langchain_core.messages import AIMessage
 
 from app.agent.agent_factory import AgentResult
@@ -108,6 +110,65 @@ async def test_continuation_bypasses_probability_and_cooldowns(tmp_path):
     assert decision.should_reply and decision.forced
     assert decision.reason == "conversation continuation"
     assert judge.calls == 0
+
+
+async def test_cooldown_decisions_expose_retry_delay(tmp_path):
+    gate, _context, _state, _cooldowns = _gate(tmp_path, judge=FakeJudge())
+    first = make_message(50, content="hi", author_id=300)
+    await gate.record_reply(first)
+
+    blocked = make_message(51, content="hello", author_id=301)
+    decision = await gate.evaluate(blocked, recent=[first, blocked])
+
+    assert not decision.should_reply
+    assert 0 < decision.retry_after <= 5
+
+
+async def test_reprocess_bypasses_duplicate_check(tmp_path):
+    gate, _context, _state, _cooldowns = _gate(tmp_path, judge=FakeJudge())
+    message = make_message(60, content="hello", author_id=300)
+
+    assert (await gate.evaluate(message, recent=[message])).should_reply
+    assert not (await gate.evaluate(message, recent=[message])).should_reply
+    assert (
+        await gate.evaluate(message, recent=[message], reprocess=True)
+    ).should_reply
+
+
+async def test_runtime_retries_message_blocked_by_cooldown(tmp_path):
+    loaded = make_loaded("deepseek-chan")
+    reply = ReplyConfig(
+        channel_cooldown_seconds=0.2,
+        user_cooldown_seconds=0.0,
+        continuation_window_seconds=0.0,
+        retry_on_cooldown=True,
+        max_cooldown_retry_seconds=5,
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"reply": reply})}
+    )
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=FakeAgentRunner(),
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+    )
+    try:
+        first = make_message(40, content="hi", is_mention=True, author_id=300)
+        await runtime.handle_message(first)
+        assert len(sender.sent) == 1
+
+        second = make_message(41, content="我也说一句", author_id=301)
+        await runtime.handle_message(second)
+        assert len(sender.sent) == 1, "the second message should hit the cooldown"
+
+        await asyncio.sleep(0.9)
+        assert len(sender.sent) == 2, "the retry should answer the blocked message"
+    finally:
+        await runtime.close()
 
 
 async def test_runtime_replies_and_stores_self_reply(tmp_path):

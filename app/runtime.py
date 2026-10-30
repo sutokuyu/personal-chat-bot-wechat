@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Protocol
 
 from app.agent.agent_factory import AgentFactory, AgentResult
@@ -32,9 +37,23 @@ from app.participation_gate import (
 from app.storage.database import Database
 from app.tools.context import AgentRuntimeContext
 from app.tools.registry import build_tools, validate_tool_names
-from app.wxauto_adapter import WxAutoAdapter
+from app.vision import ImageDescriber
+from app.wxauto_adapter import WxAutoAdapter, chat_id_for
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CachedImage:
+    """One image kept for follow-up questions, with who posted it and when."""
+
+    path: str
+    caption: str
+    sender_id: int
+    sender_name: str
+    message_id: int
+    stored_at: float
+    posted_at: datetime
 
 
 class ReplySender(Protocol):
@@ -50,7 +69,11 @@ class ReplySender(Protocol):
 
 class AgentRunner(Protocol):
     async def run(
-        self, input_text: str, *, context: AgentRuntimeContext
+        self,
+        input_text: str,
+        *,
+        context: AgentRuntimeContext,
+        images: list[str] | None = None,
     ) -> AgentResult: ...
 
 
@@ -67,6 +90,7 @@ class BotRuntime:
         extraction_runner: ExtractionRunner | None = None,
         database: Database | None = None,
         context_manager: ContextManager | None = None,
+        image_describer: ImageDescriber | None = None,
         logger_: logging.Logger | None = None,
     ) -> None:
         self.loaded = loaded
@@ -75,6 +99,7 @@ class BotRuntime:
         self.logger = logger_ or logging.getLogger(f"bot.{self.config.instance_id}")
         self.sender = sender
         self.agent_runner = agent_runner
+        self.image_describer = image_describer
         self.database = database or Database(loaded.database_path)
         self.database.initialize()
         self.policy = MemoryAccessPolicy(
@@ -110,6 +135,21 @@ class BotRuntime:
             logger_=self.logger,
         )
         self._channel_locks: dict[tuple[int, int], asyncio.Lock] = {}
+        self._retry_tasks: dict[int, asyncio.Task] = {}
+        self._retried: set[int] = set()
+        self._retried_order: deque[int] = deque()
+        # Images of the newest image message per channel, kept briefly so a
+        # follow-up like "这张图里是什么" can still be answered.
+        self._image_cache: dict[tuple[int, int], list[CachedImage]] = {}
+        wechat = self.config.wechat
+        self._chat_image_limits: dict[int, int] = {
+            chat_id_for(wechat.account_id, chat.name): (
+                chat.image_cache_size
+                if chat.image_cache_size is not None
+                else wechat.image_cache_size
+            )
+            for chat in wechat.chats
+        }
 
     def set_sender(self, sender: ReplySender) -> None:
         self.sender = sender
@@ -121,7 +161,62 @@ class BotRuntime:
             self._channel_locks[key] = lock
         return lock
 
+    def _schedule_cooldown_retry(
+        self, message: IncomingMessage, retry_after: float
+    ) -> None:
+        """Re-judge a cooldown-blocked message once instead of dropping it.
+
+        Without this, a user who keeps chatting refreshes the channel cooldown
+        and everyone else's messages inside those windows are lost forever.
+        """
+
+        reply = self.config.reply
+        if not reply.retry_on_cooldown or retry_after <= 0:
+            return
+        if message.is_bot or message.message_id in self._retried:
+            return
+        if retry_after > reply.max_cooldown_retry_seconds:
+            return
+
+        self._retried.add(message.message_id)
+        self._retried_order.append(message.message_id)
+        while len(self._retried_order) > 4000:
+            self._retried.discard(self._retried_order.popleft())
+
+        delay = retry_after + 0.3
+        task = asyncio.create_task(
+            self._retry_after_delay(message, delay),
+            name=f"cooldown-retry-{message.message_id}",
+        )
+        self._retry_tasks[message.message_id] = task
+        task.add_done_callback(
+            lambda _task, mid=message.message_id: self._retry_tasks.pop(mid, None)
+        )
+        self.logger.debug(
+            "message_retry_scheduled channel=%s message=%s delay=%.1fs",
+            message.channel_id,
+            message.message_id,
+            delay,
+        )
+
+    async def _retry_after_delay(self, message: IncomingMessage, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            async with self._lock_for(message.key):
+                await self._handle_message_locked(message, reprocess=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception(
+                "message_retry_failed message=%s", message.message_id
+            )
+
     async def handle_message(self, message: IncomingMessage) -> None:
+        self._prune_all_images()
+        captions: list[str] = []
+        if message.image_paths:
+            message, captions = await self._describe_images(message)
+            self._retain_images(message, captions)
         key = message.key
         self.context.add_message(message)
         try:
@@ -142,7 +237,169 @@ class BotRuntime:
             except Exception:
                 self.logger.exception("extractor_schedule_failed")
 
-    async def _handle_message_locked(self, message: IncomingMessage) -> None:
+    async def _describe_images(
+        self, message: IncomingMessage
+    ) -> tuple[IncomingMessage, list[str]]:
+        """Turn downloaded images into text the gate and transcript can use."""
+
+        captions: list[str] = []
+        for path in message.image_paths:
+            caption = ""
+            if self.image_describer is not None:
+                caption = await self.image_describer.describe(path)
+            captions.append(caption.strip() or "（图片内容未能识别）")
+
+        joined = "；".join(dict.fromkeys(captions))
+        self.logger.info(
+            "image_described message=%s images=%d chars=%d",
+            message.message_id,
+            len(message.image_paths),
+            len(joined),
+        )
+        return replace(message, content=f"[图片] {joined}".strip()), captions
+
+    # ------------------------------------------------------------ image cache
+    def _image_limit(self, key: tuple[int, int]) -> int:
+        return self._chat_image_limits.get(key[1], self.config.wechat.image_cache_size)
+
+    def _retain_images(self, message: IncomingMessage, captions: list[str]) -> None:
+        """Store this message's images (FIFO per chat) for follow-up questions."""
+
+        limit = self._image_limit(message.key)
+        if limit <= 0 or not self.config.wechat.image_followup_seconds:
+            self._cleanup_images(message)
+            return
+
+        entries = self._image_cache.setdefault(message.key, [])
+        stored_at = time.monotonic()
+        for path, caption in zip(message.image_paths, captions or [""] * len(message.image_paths)):
+            entries.append(
+                CachedImage(
+                    path=path,
+                    caption=caption,
+                    sender_id=message.author_id,
+                    sender_name=message.author_name,
+                    message_id=message.message_id,
+                    stored_at=stored_at,
+                    posted_at=message.created_at,
+                )
+            )
+        while len(entries) > limit:
+            evicted = entries.pop(0)
+            self._delete_files((evicted.path,))
+            self.logger.debug(
+                "image_evicted channel=%s message=%s path=%s",
+                message.channel_id,
+                evicted.message_id,
+                Path(evicted.path).name,
+            )
+        self.logger.info(
+            "image_cached channel=%s message=%s added=%d cached=%d limit=%d ttl=%.0fs",
+            message.channel_id,
+            message.message_id,
+            len(message.image_paths),
+            len(entries),
+            limit,
+            self.config.wechat.image_followup_seconds,
+        )
+
+    def _fresh_images(self, key: tuple[int, int]) -> list[CachedImage]:
+        """Cached images for this chat that are still inside the TTL, oldest first."""
+
+        entries = self._image_cache.get(key)
+        if not entries:
+            return []
+        ttl = self.config.wechat.image_followup_seconds
+        now = time.monotonic()
+        kept: list[CachedImage] = []
+        for entry in entries:
+            if ttl <= 0 or now - entry.stored_at > ttl or not Path(entry.path).exists():
+                self._delete_files((entry.path,))
+            else:
+                kept.append(entry)
+        if kept:
+            self._image_cache[key] = kept
+        else:
+            self._image_cache.pop(key, None)
+        return kept
+
+    def _select_images(
+        self, message: IncomingMessage
+    ) -> tuple[list[CachedImage], list[CachedImage]]:
+        """Pick the images that most likely belong to this follow-up message.
+
+        Images from the same sender win over images from other members, and
+        newer images win over older ones. All fresh images are still reported
+        in the prompt as context, even when only a few are attached.
+        """
+
+        entries = self._fresh_images(message.key)
+        if not entries:
+            return [], []
+        limit = self.config.wechat.image_followup_max_images
+        ranked = sorted(
+            entries,
+            key=lambda entry: (
+                entry.sender_id == message.author_id,
+                entry.stored_at,
+            ),
+            reverse=True,
+        )[:limit]
+        return sorted(ranked, key=lambda entry: entry.stored_at), entries
+
+    def _image_context(self, entries: list[CachedImage], attached: list[CachedImage]) -> str:
+        """Prompt block describing the cached images and which ones are attached."""
+
+        if not entries:
+            return ""
+
+        def clean(value: str, limit: int = 160) -> str:
+            text = " ".join(str(value).split())
+            return text.replace("<", "＜").replace(">", "＞")[:limit]
+
+        lines: list[str] = []
+        labels: dict[str, str] = {}
+        for index, entry in enumerate(entries, start=1):
+            label = f"img {index}"
+            labels[entry.path] = label
+            lines.append(
+                f"[{label}] {entry.posted_at.astimezone().strftime('%H:%M')} "
+                f"{clean(entry.sender_name, 40)} (user_id={entry.sender_id}): "
+                f"{clean(entry.caption)}"
+            )
+        attached_labels = [
+            labels[entry.path] for entry in attached if entry.path in labels
+        ]
+        footer = (
+            "The images attached to this message are, in order: "
+            + ", ".join(attached_labels)
+            + ". Use them only when the newest message actually refers to a picture."
+            if attached_labels
+            else "No image is attached to this message; the captions above are all the bot has."
+        )
+        return "\n".join(lines) + "\n" + footer
+
+    def _prune_all_images(self) -> None:
+        for key in list(self._image_cache):
+            self._fresh_images(key)
+
+    def _forget_images(self, key: tuple[int, int]) -> None:
+        for entry in self._image_cache.pop(key, []):
+            self._delete_files((entry.path,))
+
+    def _delete_files(self, paths: tuple[str, ...]) -> None:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                self.logger.debug("image_cleanup_failed path=%s", path)
+
+    def _cleanup_images(self, message: IncomingMessage) -> None:
+        self._delete_files(message.image_paths)
+
+    async def _handle_message_locked(
+        self, message: IncomingMessage, *, reprocess: bool = False
+    ) -> None:
         # Snowflake ids sort chronologically; ignore messages that arrived while
         # this one was waiting for the per-channel lock.
         recent = [
@@ -150,8 +407,19 @@ class BotRuntime:
             for item in self.context.recent(message.key)
             if item.message_id <= message.message_id
         ]
-        decision = await self.gate.evaluate(message, recent=recent)
+        attached: list[CachedImage] = []
+        image_context = ""
+        if not message.image_paths:
+            attached, cached = self._select_images(message)
+            image_context = self._image_context(cached, attached)
+        decision = await self.gate.evaluate(
+            message,
+            recent=recent,
+            reprocess=reprocess,
+            image_context=image_context,
+        )
         if not decision.should_reply:
+            self._schedule_cooldown_retry(message, decision.retry_after)
             self.logger.debug(
                 "message_skipped instance=%s guild=%s channel=%s message=%s reason=%s",
                 self.config.instance_id,
@@ -200,13 +468,33 @@ class BotRuntime:
                 self.repository.upsert_user_profile, trusted_ctx.trusted()
             )
 
+            attached: list[CachedImage] = []
+            image_context = ""
+            if not message.image_paths:
+                attached, cached = self._select_images(message)
+                image_context = self._image_context(cached, attached)
+                if attached:
+                    self.logger.info(
+                        "image_followup channel=%s message=%s attached=%d cached=%d",
+                        message.channel_id,
+                        message.message_id,
+                        len(attached),
+                        len(cached),
+                    )
+            images = [entry.path for entry in attached] or list(message.image_paths)
+
             agent_input = build_agent_input(
                 recent,
                 message,
                 merge_window_seconds=self.config.context.merge_window_seconds,
+                image_context=image_context,
             )
             try:
-                result = await self.agent_runner.run(agent_input, context=trusted_ctx)
+                result = await self.agent_runner.run(
+                    agent_input,
+                    context=trusted_ctx,
+                    images=images or None,
+                )
             except AgentTimeoutError:
                 self.logger.warning(
                     "reply_aborted reason=agent_timeout message=%s", message.message_id
@@ -272,6 +560,17 @@ class BotRuntime:
         return text[:limit].rstrip()
 
     async def close(self) -> None:
+        tasks = list(self._retry_tasks.values())
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._retry_tasks.clear()
+        for key in list(self._image_cache):
+            self._forget_images(key)
         await self.extractor.close()
 
 
@@ -297,6 +596,7 @@ def create_runtime(
     extraction_runner: ExtractionRunner | None = None,
     database: Database | None = None,
     sender: ReplySender | None = None,
+    image_describer: ImageDescriber | None = None,
 ) -> BotRuntime:
     """Wire production dependencies; tests inject fakes here."""
 
@@ -339,6 +639,14 @@ def create_runtime(
             timeout_seconds=config.memory.extraction_timeout_seconds,
         )
 
+    if image_describer is None and config.wechat.capture_images:
+        vision_model = (
+            model_factory(config.model)
+            if model_factory is not None
+            else build_chat_model(config.model, temperature=0.0)
+        )
+        image_describer = ImageDescriber(vision_model, timeout_seconds=30.0)
+
     return BotRuntime(
         loaded,
         agent_runner=agent_runner,
@@ -346,4 +654,5 @@ def create_runtime(
         judge=judge,
         extraction_runner=extraction_runner,
         database=database,
+        image_describer=image_describer,
     )

@@ -51,11 +51,26 @@ class FakeAgentRunner:
     )
     calls: list[Any] = field(default_factory=list)
 
-    async def run(self, input_text: str, *, context: Any) -> AgentResult:
-        self.calls.append((input_text, context))
+    async def run(
+        self, input_text: str, *, context: Any, images: list[str] | None = None
+    ) -> AgentResult:
+        self.calls.append((input_text, context, images))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+@dataclass
+class FakeImageDescriber:
+    captions: list[str] = field(default_factory=lambda: ["一只橘猫躺在沙发上"])
+    paths: list[str] = field(default_factory=list)
+    calls: int = 0
+
+    async def describe(self, path: str) -> str:
+        self.paths.append(str(path))
+        caption = self.captions[min(self.calls, len(self.captions) - 1)]
+        self.calls += 1
+        return caption
 
 
 @dataclass
@@ -74,8 +89,12 @@ class FakeJudge:
         default_factory=lambda: [ParticipationDecision(should_reply=True, reason="test")]
     )
     calls: int = 0
+    image_contexts: list[str] = field(default_factory=list)
 
-    async def judge(self, transcript: str, current: IncomingMessage):
+    async def judge(
+        self, transcript: str, current: IncomingMessage, **kwargs
+    ):
+        self.image_contexts.append(kwargs.get("image_context", ""))
         decision = self.decisions[min(self.calls, len(self.decisions) - 1)]
         self.calls += 1
         return decision

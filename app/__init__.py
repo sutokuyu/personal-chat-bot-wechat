@@ -1,4 +1,4 @@
-"""Single-account DeepSeek WeChat bot driven by wxauto."""
+"""Single-account DeepSeek WeChat bot driven by wxauto4."""
 
 __all__ = ["__version__"]
 

@@ -149,5 +149,7 @@ def test_example_wechat_instance_is_valid():
     )
     assert loaded.persona.persona_id == "deepseek-chan"
     assert loaded.config.wechat.account_id == "wechat-main"
-    assert any(chat.kind == "direct" for chat in loaded.config.wechat.chats)
+    assert loaded.config.wechat.chats
+    assert all(chat.name.strip() for chat in loaded.config.wechat.chats)
+    assert all(chat.kind in {"direct", "group"} for chat in loaded.config.wechat.chats)
     assert loaded.config.model.api_key_env == "DEEPSEEK_API_KEY"

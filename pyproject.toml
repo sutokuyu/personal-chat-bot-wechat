@@ -1,15 +1,15 @@
 [project]
 name = "personal-chat-bot-wechat"
 version = "1.0.0"
-description = "Single-account DeepSeek WeChat bot driven by wxauto and LangChain"
-requires-python = ">=3.11"
+description = "Single-account DeepSeek WeChat bot driven by wxauto4 and LangChain"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "langchain>=1.4,<2",
     "langchain-deepseek>=1.1,<2",
     "pydantic>=2.14,<3",
     "PyYAML>=6.0,<7",
     "python-dotenv>=1.2,<2",
-    "wxauto>=3.9.11,<4; sys_platform == 'win32'",
+    "wxauto4>=41.1.7,<42; sys_platform == 'win32'",
 ]
 
 [tool.pytest.ini_options]
