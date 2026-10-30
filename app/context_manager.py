@@ -11,11 +11,23 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Iterable
+from typing import Deque, Iterable, Protocol
 
 from app.utils import truncate, utcnow
 
 ChannelKey = tuple[int, int]  # (guild_id, channel_id)
+
+
+class PendingStore(Protocol):
+    """Optional durable backing for the extraction buffer."""
+
+    def append(self, message: "IncomingMessage") -> None: ...
+
+    def load(
+        self, key: ChannelKey, *, after: datetime | None = None
+    ) -> list["IncomingMessage"]: ...
+
+    def discard(self, key: ChannelKey, message_ids: list[int]) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +66,11 @@ class ContextManager:
         max_messages: int = 30,
         seen_limit: int = 4000,
         track_extraction: bool = True,
+        pending_store: "PendingStore | None" = None,
     ) -> None:
         self.max_messages = max_messages
         self.track_extraction = track_extraction
+        self.pending_store = pending_store
         self._channels: dict[ChannelKey, ChannelContext] = {}
         self._seen_order: Deque[int] = deque()
         self._seen: set[int] = set()
@@ -85,14 +99,20 @@ class ContextManager:
             return True
 
     def add_message(self, message: IncomingMessage) -> None:
+        track = self.track_extraction and not message.is_bot
         with self._lock:
             channel = self._channel(message.key)
             channel.history.append(message)
             # Other bots may be treated as chat participants, but their text is
             # not durable user memory. Self-authored messages are filtered by the
             # WeChat adapter before reaching this method.
-            if self.track_extraction and not message.is_bot:
+            if track:
                 channel.extraction_buffer.append(message)
+        store = self.pending_store if track else None
+        if store is not None:
+            # Persisted so a restart does not discard progress towards the
+            # extraction threshold.
+            store.append(message)
 
     def add_bot_reply(
         self,
@@ -147,6 +167,45 @@ class ContextManager:
             count = min(max_size, len(channel.extraction_buffer))
             batch = [channel.extraction_buffer.popleft() for _ in range(count)]
             return batch
+
+    def hydrate_extraction_buffer(
+        self, key: ChannelKey, messages: Iterable[IncomingMessage]
+    ) -> int:
+        """Reload messages persisted by a previous process, oldest first."""
+
+        loaded = 0
+        with self._lock:
+            channel = self._channel(key)
+            known = {item.message_id for item in channel.extraction_buffer}
+            merged = list(channel.extraction_buffer)
+            for message in messages:
+                if message.is_bot or message.message_id in known:
+                    continue
+                known.add(message.message_id)
+                merged.append(message)
+                loaded += 1
+            merged.sort(key=lambda item: (item.created_at, item.message_id))
+            channel.extraction_buffer.clear()
+            channel.extraction_buffer.extend(merged)
+        return loaded
+
+    def drop_extracted(self, key: ChannelKey, message_ids: list[int]) -> None:
+        """Forget messages that have already been mined into long-term memory."""
+
+        ids = set(message_ids)
+        with self._lock:
+            channel = self._channels.get(key)
+            if channel is not None:
+                kept = [
+                    item
+                    for item in channel.extraction_buffer
+                    if item.message_id not in ids
+                ]
+                channel.extraction_buffer.clear()
+                channel.extraction_buffer.extend(kept)
+            store = self.pending_store
+        if store is not None:
+            store.discard(key, message_ids)
 
     def requeue_extraction_batch(
         self, key: ChannelKey, batch: Iterable[IncomingMessage], *, limit: int = 500

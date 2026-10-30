@@ -72,6 +72,7 @@ class FakeWx:
         self.send_error: str | None = None
         self.sessions: list[dict] | None = None
         self.session_error: str | None = None
+        self.send_gap = 0.0
 
     def add_chat(self, name: str, *messages: RawMessage) -> None:
         self.history.setdefault(name, []).extend(messages)
@@ -89,7 +90,14 @@ class FakeWx:
         return list(self.history.get(self.current or "", []))
 
     def SendMsg(self, msg: str, who: str | None = None, exact: bool = False):
-        self.sent.append((who, msg))
+        # Model wxauto4: sending switches the window to ``who``, waits for the
+        # editor to appear, and only then types. ``send_gap`` widens that window
+        # so concurrent-switch races are reproducible in tests.
+        if who:
+            self.ChatWith(who)
+        if self.send_gap:
+            time.sleep(self.send_gap)
+        self.sent.append((self.current, msg))
         if self.send_error:
             return {"status": "失败", "message": self.send_error, "data": None}
         return _OK
@@ -534,6 +542,37 @@ async def test_send_reply_routes_to_configured_chat():
     assert await adapter.send_reply(channel_id=channel_id, guild_id=1, text="收到")
     assert wx.sent == [("Alice", "收到")]
     assert not await adapter.send_reply(channel_id=123, guild_id=1, text="unknown")
+
+
+async def test_send_is_not_hijacked_by_a_concurrent_poll():
+    """Regression: a reply for group A must never land in group B.
+
+    wxauto4 implements SendMsg(who=...) as "switch to who, wait for the editor,
+    then type". A poll that switches chats in another thread used to steal the
+    text mid-send, which is how a reply for one group appeared in another.
+    """
+
+    wx = FakeWx()
+    wx.add_chat("Alice", RawMessage(sender="Alice", content="hi", id="a1"))
+    wx.add_chat("Bob", RawMessage(sender="Bob", content="yo", id="b1"))
+    wx.send_gap = 0.03
+    adapter = _adapter(
+        wx, config=_config(("Alice", "group"), ("Bob", "group"), poll_interval=0.2)
+    )
+    await adapter.poll_once()
+
+    channel_id = chat_id_for("wechat-main", "Alice")
+    sending = asyncio.create_task(
+        adapter.send_reply(channel_id=channel_id, guild_id=1, text="for Alice")
+    )
+    # Let the send reach its "switched, waiting for the editor" gap first.
+    await asyncio.sleep(0.01)
+    for _ in range(6):
+        await adapter.poll_once()
+        await asyncio.sleep(0.005)
+
+    assert await sending
+    assert wx.sent == [("Alice", "for Alice")], "text must stay in the origin chat"
 
 
 async def test_send_reply_reports_rejection():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -245,10 +245,13 @@ def test_bot_state_and_extraction_cursor_are_instance_scoped(tmp_path):
     assert state.get_value("mika", "cooldown_channel", guild_id="1", channel_id="2") == "x"
     assert state.get_value("ren", "cooldown_channel", guild_id="1", channel_id="2") is None
 
-    assert state.advance_extraction_cursor("mika", "2", 100) is True
-    assert state.advance_extraction_cursor("mika", "2", 90) is False
-    assert state.get_extraction_cursor("mika", "2") == 100
-    assert state.get_extraction_cursor("ren", "2") == 0
+    earlier = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    later = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    assert state.advance_extraction_cursor("mika", "2", later) is True
+    assert state.advance_extraction_cursor("mika", "2", earlier) is False
+    assert state.get_extraction_cursor("mika", "2") == later
+    assert state.get_extraction_cursor("ren", "2") is None
 
 
 def test_cross_instance_message_claim_is_short_lived_and_releasable(tmp_path):

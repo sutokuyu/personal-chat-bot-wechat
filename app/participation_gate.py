@@ -287,7 +287,7 @@ class ParticipationGate:
         # message can still be considered when the preceding message is a human.
         if message.is_bot and not self.participation.allow_consecutive_bot_messages:
             previous = [
-                item for item in recent if item.message_id < message.message_id
+                item for item in recent if item.created_at < message.created_at
             ]
             if previous and previous[-1].is_bot:
                 return GateDecision(False, "consecutive bot messages")

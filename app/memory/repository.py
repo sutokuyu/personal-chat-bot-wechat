@@ -33,6 +33,7 @@ from app.utils import (
     parse_iso,
     tokenize,
     truncate,
+    try_parse_iso,
     utcnow,
 )
 
@@ -287,14 +288,16 @@ class MemoryRepository:
                     cursor = conn.execute(
                         """
                         INSERT INTO memories
-                            (guild_id, user_id, scope, persona_id, category, content,
-                             content_hash, importance, confidence, source_message_id,
-                             created_at, updated_at, expires_at, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                            (guild_id, user_id, channel_id, scope, persona_id,
+                             category, content, content_hash, importance,
+                             confidence, source_message_id, created_at,
+                             updated_at, expires_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
                         """,
                         (
                             ctx.guild_id,
                             ctx.user_id,
+                            ctx.channel_id,
                             scope.value,
                             persona_id,
                             category,
@@ -576,11 +579,17 @@ class BotStateRepository:
             return None
 
     def advance_extraction_cursor(
-        self, instance_id: str, channel_id: str, message_id: int
+        self, instance_id: str, channel_id: str, processed_at: datetime
     ) -> bool:
-        """Atomically advance a channel cursor. Returns False if already ahead."""
+        """Record the newest processed message timestamp for a channel.
+
+        WeChat message ids in this project are content hashes, so they are NOT
+        monotonically increasing and must never be compared. Ordering uses the
+        receive timestamp instead.
+        """
 
         now = isoformat(utcnow())
+        value = isoformat(processed_at)
         key = "memory_extraction_cursor"
 
         def operation() -> bool:
@@ -593,9 +602,10 @@ class BotStateRepository:
                     """,
                     (instance_id, channel_id, key),
                 ).fetchone()
-                current = int(row["value"]) if row and str(row["value"]).isdigit() else 0
-                if current >= message_id:
-                    return False
+                if row is not None:
+                    current = try_parse_iso(str(row["value"]))
+                    if current is not None and current >= processed_at:
+                        return False
                 conn.execute(
                     """
                     INSERT INTO bot_state
@@ -604,15 +614,25 @@ class BotStateRepository:
                     ON CONFLICT (instance_id, guild_id, channel_id, user_id, state_key)
                     DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                     """,
-                    (instance_id, channel_id, key, str(message_id), now),
+                    (instance_id, channel_id, key, value, now),
                 )
                 return True
 
         return self.db.write(operation)
 
-    def get_extraction_cursor(self, instance_id: str, channel_id: str) -> int:
-        value = self.get_value(instance_id, "memory_extraction_cursor", channel_id=channel_id)
-        return int(value) if value and value.isdigit() else 0
+    def get_extraction_cursor(
+        self, instance_id: str, channel_id: str
+    ) -> datetime | None:
+        """Newest processed message timestamp, or None when unknown.
+
+        Databases written before the timestamp cursor existed stored a message
+        hash here; those values are ignored so extraction simply re-runs once.
+        """
+
+        value = self.get_value(
+            instance_id, "memory_extraction_cursor", channel_id=channel_id
+        )
+        return try_parse_iso(value)
 
     # -------------------------------------------------- cross-instance reply claim
     _CLAIM_INSTANCE = "__shared__"

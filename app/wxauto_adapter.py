@@ -168,6 +168,11 @@ class WxAutoAdapter:
         # from replaying history without blocking a re-sent picture.
         self._prev_keys: dict[str, list[str]] = {}
         self._max_catchup = 10
+        # Every WeChat UI interaction (switch chat, read, capture an image,
+        # send) mutates the same shared window. Without one lock, a send that
+        # switches to chat A can be interleaved with a poll that switches to
+        # chat B, and the reply lands in the wrong chat.
+        self._ui_lock = threading.RLock()
         # Dispatched message ids with a short memory: a repaint must not create
         # a duplicate, but sending the same picture again minutes later must.
         self._seen_at: dict[int, float] = {}
@@ -308,32 +313,50 @@ class WxAutoAdapter:
                 continue
 
             try:
-                raw_messages = await asyncio.to_thread(self._read_chat, chat.name, False)
+                messages = await asyncio.to_thread(
+                    self._poll_chat_blocking, chat, unread.get(chat.name, 0)
+                )
             except Exception:
                 self.logger.exception("wxauto4_poll_failed chat=%s", chat.name)
                 continue
+            for message in messages:
+                if self._already_handled(message.message_id):
+                    continue
+                received.append(message)
+                await self._handle_safely(message)
+        return received
+
+    def _poll_chat_blocking(
+        self, chat: WeChatChatConfig, unread: int
+    ) -> list[IncomingMessage]:
+        """Read one chat and convert its new messages under the UI lock.
+
+        Conversion happens here (not in the event loop) because image controls
+        die as soon as another chat is opened, and because a concurrent send
+        would otherwise switch the window away mid-read.
+        """
+
+        with self._ui_lock:
+            raw_messages = self._read_chat_locked(chat.name, False)
             self._check_rendering(chat.name, len(raw_messages))
             candidates = self._candidates(raw_messages, chat)
             self.logger.debug(
                 "wxauto4_poll chat=%s rendered=%d unread=%d new=%d last=%r",
                 chat.name,
                 len(raw_messages),
-                unread.get(chat.name, 0),
+                unread,
                 len(candidates),
                 self._raw_message_key(raw_messages[-1])[:40] if raw_messages else None,
             )
+            messages: list[IncomingMessage] = []
             for raw in candidates:
                 message = self.to_internal(raw, chat)
-                if message is None:
-                    continue
-                if self._already_handled(message.message_id):
-                    continue
-                received.append(message)
-                await self._handle_safely(message)
+                if message is not None:
+                    messages.append(message)
             self._prev_keys[chat.name] = [
                 self._raw_message_key(raw) for raw in raw_messages
             ]
-        return received
+            return messages
 
     def _already_handled(self, message_id: int) -> bool:
         """True when this exact message was dispatched moments ago.
@@ -358,7 +381,8 @@ class WxAutoAdapter:
         if self.wx is None:
             return {}
         try:
-            sessions = self.wx.GetSession()
+            with self._ui_lock:
+                sessions = self.wx.GetSession()
         except Exception:
             self.logger.debug("wxauto4_session_failed", exc_info=True)
             return {}
@@ -483,6 +507,10 @@ class WxAutoAdapter:
         raise RuntimeError(f"chat {chat_name!r} unavailable: {failure}")
 
     def _read_chat(self, chat_name: str, strict: bool) -> list[Any]:
+        with self._ui_lock:
+            return self._read_chat_locked(chat_name, strict)
+
+    def _read_chat_locked(self, chat_name: str, strict: bool) -> list[Any]:
         self._open_chat(chat_name, strict=strict)
         try:
             messages = self.wx.GetAllMessage()
@@ -742,15 +770,22 @@ class WxAutoAdapter:
         return sent
 
     def _send_blocking(self, chat_name: str, text: str) -> bool:
-        try:
-            result = self.wx.SendMsg(text, who=chat_name, exact=True)
-        except Exception:
-            self.logger.exception("wxauto4_send_failed chat=%s", chat_name)
-            return False
+        # Hold the UI lock across "switch to the chat" and "type the message":
+        # a poll running in another thread must not switch the window in
+        # between, or the text is delivered to the wrong chat.
+        with self._ui_lock:
+            try:
+                result = self.wx.SendMsg(text, who=chat_name, exact=True)
+            except Exception:
+                self.logger.exception("wxauto4_send_failed chat=%s", chat_name)
+                return False
         error = response_error(result)
         if error:
             self.logger.error(
                 "wxauto4_send_rejected chat=%s detail=%s", chat_name, error
             )
             return False
+        self.logger.info(
+            "wxauto4_sent chat=%s chars=%d", chat_name, len(text)
+        )
         return True

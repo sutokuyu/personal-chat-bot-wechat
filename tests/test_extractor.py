@@ -1,4 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -50,12 +52,29 @@ def _build(tmp_path, runner, *, config=None):
     return extractor, context, repo, state
 
 
+_SEED_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_SEED_END = _SEED_START + timedelta(minutes=1)
+_LATER_END = _SEED_END + timedelta(minutes=2)
+
+
 def _seed_batch(context):
+    base = _SEED_START
     context.add_message(
-        make_message(1, content="我最近很喜欢文明6和策略游戏", author_id=300)
+        make_message(
+            1,
+            content="我最近很喜欢文明6和策略游戏",
+            author_id=300,
+            created_at=base,
+        )
     )
     context.add_message(
-        make_message(2, content="我下个月要去北海道旅行", author_id=301, author_name="Bob")
+        make_message(
+            2,
+            content="我下个月要去北海道旅行",
+            author_id=301,
+            author_name="Bob",
+            created_at=base + timedelta(minutes=1),
+        )
     )
 
 
@@ -116,7 +135,7 @@ async def test_extractor_applies_add_update_ignore_and_advances_cursor(tmp_path)
     assert report.added == 1
     assert report.updated == 1
     assert report.ignored == 1
-    assert state.get_extraction_cursor("mika", "200") == 2
+    assert state.get_extraction_cursor("mika", "200") == _SEED_END
 
     ctx_300 = TrustedContext("mika", "mika", "100", "200", "300", "Alice", "1")
     ctx_301 = TrustedContext("mika", "mika", "100", "200", "301", "Bob", "2")
@@ -243,7 +262,7 @@ async def test_model_failure_is_retried_then_succeeds(tmp_path):
     assert first[0].skipped is True
     assert first[-1].report.added == 1
     assert context.pending_extraction_count((100, 200)) == 0
-    assert state.get_extraction_cursor("mika", "200") == 2
+    assert state.get_extraction_cursor("mika", "200") == _SEED_END
     assert repo.count_active_memories() == 1
     assert runner.calls == 2
 
@@ -272,15 +291,22 @@ async def test_permanent_failure_does_not_block_future_batches(tmp_path):
     first = await extractor.drain_channel((100, 200))
     assert first[0].skipped is True
     assert context.pending_extraction_count((100, 200)) == 0
-    assert state.get_extraction_cursor("mika", "200") == 2
+    assert state.get_extraction_cursor("mika", "200") == _SEED_END
 
     context.add_message(
-        make_message(3, content="我喜欢文明6和策略游戏", author_id=300)
+        make_message(
+            3,
+            content="我喜欢文明6和策略游戏",
+            author_id=300,
+            created_at=_SEED_END + timedelta(minutes=1),
+        )
     )
-    context.add_message(make_message(4, content="继续聊", author_id=300))
+    context.add_message(
+        make_message(4, content="继续聊", author_id=300, created_at=_LATER_END)
+    )
     second = await extractor.drain_channel((100, 200))
     assert second[0].report.added == 1
-    assert state.get_extraction_cursor("mika", "200") == 4
+    assert state.get_extraction_cursor("mika", "200") == _LATER_END
 
 
 def test_write_service_programmatically_deduplicates_add(tmp_path):

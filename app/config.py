@@ -112,10 +112,14 @@ class WebSearchConfig(StrictModel):
 class MemoryConfig(StrictModel):
     enabled: bool = True
     allow_shared_memory: bool = False
-    extraction_threshold: int = Field(default=12, ge=2, le=100)
+    extraction_threshold: int = Field(default=5, ge=2, le=100)
     extraction_batch_size: int = Field(default=20, ge=2, le=100)
     extraction_max_attempts: int = Field(default=3, ge=1, le=10)
     extraction_timeout_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
+    # Keep messages waiting for extraction on disk so a restart does not throw
+    # away progress towards extraction_threshold.
+    persist_pending: bool = True
+    pending_max_per_channel: int = Field(default=200, ge=10, le=2000)
     max_memories_per_search: int = Field(default=5, ge=1, le=20)
     max_memory_chars: int = Field(default=500, ge=20, le=2000)
     min_importance: float = Field(default=0.4, ge=0.0, le=1.0)

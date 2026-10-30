@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterable, Protocol
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -333,7 +334,7 @@ class MemoryExtractor:
         self.logger = logger_ or logger
         self.retry_delay_seconds = retry_delay_seconds
         self._running: dict[tuple[int, int], asyncio.Task] = {}
-        self._attempts: dict[int, int] = {}
+        self._attempts: dict[datetime, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -375,8 +376,11 @@ class MemoryExtractor:
         self, key: tuple[int, int], batch: list[IncomingMessage]
     ) -> ExtractionResult:
         assert self.runner is not None
-        end_id = max(message.message_id for message in batch)
-        if self.state.get_extraction_cursor(self.instance_id, str(key[1])) >= end_id:
+        # Message ids are content hashes (not ordered), so the cursor tracks the
+        # newest receive timestamp instead.
+        end_at = max(message.created_at for message in batch)
+        cursor = self.state.get_extraction_cursor(self.instance_id, str(key[1]))
+        if cursor is not None and cursor >= end_at:
             return ExtractionResult(processed=0, report=ApplyReport(), skipped=True)
 
         try:
@@ -388,7 +392,7 @@ class MemoryExtractor:
                 channel_id=str(key[1]),
                 user_id=str(batch[-1].author_id),
                 user_name=batch[-1].author_name,
-                message_id=str(end_id),
+                message_id=str(batch[-1].message_id),
                 allow_shared_memory=self.config.allow_shared_memory,
             )
             service = MemoryWriteService(self.repository, self.repository.policy, self.config)
@@ -399,8 +403,8 @@ class MemoryExtractor:
             self.context.requeue_extraction_batch(key, batch)
             raise
         except Exception as exc:
-            attempts = self._attempts.get(end_id, 0) + 1
-            self._attempts[end_id] = attempts
+            attempts = self._attempts.get(end_at, 0) + 1
+            self._attempts[end_at] = attempts
             self.logger.warning(
                 "memory_extraction_failed channel=%s attempts=%s error=%s",
                 key[1],
@@ -413,12 +417,14 @@ class MemoryExtractor:
                 return ExtractionResult(processed=len(batch), report=ApplyReport(), skipped=True)
             # Give up on this batch so a permanently failing model cannot block
             # all future extraction for the channel.
-            self.state.advance_extraction_cursor(self.instance_id, str(key[1]), end_id)
-            self._attempts.pop(end_id, None)
+            self.state.advance_extraction_cursor(self.instance_id, str(key[1]), end_at)
+            self._attempts.pop(end_at, None)
+            self.context.drop_extracted(key, [message.message_id for message in batch])
             return ExtractionResult(processed=len(batch), report=ApplyReport(), skipped=True)
 
-        self.state.advance_extraction_cursor(self.instance_id, str(key[1]), end_id)
-        self._attempts.pop(end_id, None)
+        self.state.advance_extraction_cursor(self.instance_id, str(key[1]), end_at)
+        self._attempts.pop(end_at, None)
+        self.context.drop_extracted(key, [message.message_id for message in batch])
         self.logger.info(
             "memory_extraction_done channel=%s messages=%s added=%s updated=%s "
             "ignored=%s rejected=%s",

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -77,8 +77,58 @@ CREATE TABLE IF NOT EXISTS bot_state (
 CREATE INDEX IF NOT EXISTS ix_bot_state_updated ON bot_state (updated_at);
 """
 
-_MIGRATIONS: tuple[tuple[int, str], ...] = ((1, _MIGRATION_1),)
+_MIGRATION_2 = """
+-- Memories are scoped to one chat: the user_id hashes the chat name, so the
+-- same person in two groups is two different users. Recording the channel
+-- makes that scope visible (and survives chat renames for display).
+ALTER TABLE memories ADD COLUMN channel_id TEXT NOT NULL DEFAULT '';
 
+CREATE INDEX IF NOT EXISTS ix_memories_channel
+    ON memories (guild_id, channel_id, status, scope, persona_id);
+
+-- Backfill for rows written before the column existed. A user_id can only
+-- belong to one chat, and bot_state already records which channel each user
+-- was last replied to in.
+UPDATE memories
+SET channel_id = COALESCE(
+    (
+        SELECT bs.channel_id FROM bot_state bs
+        WHERE bs.state_key = 'last_bot_reply'
+          AND bs.user_id = memories.user_id
+          AND bs.channel_id != ''
+        LIMIT 1
+    ),
+    ''
+)
+WHERE channel_id = '';
+"""
+
+_MIGRATION_3 = """
+-- Messages waiting to be mined for long-term memory. Without this the queue
+-- lived only in RAM, so every bot restart threw away the progress towards
+-- extraction_threshold and extraction almost never ran.
+-- Rows are deleted as soon as a batch has been processed.
+CREATE TABLE IF NOT EXISTS pending_messages (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    author_name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, channel_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_pending_messages_channel
+    ON pending_messages (guild_id, channel_id, message_id);
+"""
+
+_MIGRATIONS: tuple[tuple[int, str], ...] = (
+    (1, _MIGRATION_1),
+    (2, _MIGRATION_2),
+    (3, _MIGRATION_3),
+)
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
     row = conn.execute("PRAGMA user_version").fetchone()

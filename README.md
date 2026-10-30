@@ -52,11 +52,17 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-如果 PowerShell 禁止激活脚本，也可以直接使用：
+如果 PowerShell 禁止激活脚本，也可以直接使用虚拟环境里的解释器（**推荐，不需要激活**）：
 
 ```powershell
+.\.venv\Scripts\python.exe -m app --list-memories
 .\.venv\Scripts\python.exe -m pytest
 ```
+
+> **注意**：本项目所有依赖都装在 `.venv` 里，**没有**装进系统 Python。
+> 如果直接敲 `python -m app` 报 `No module named 'yaml'`（或其他第三方包），
+> 说明用的是系统 Python。此时 `python -m app` 会提示当前解释器路径和正确命令，
+> 按提示改用 `.\.venv\Scripts\python.exe -m app`，或先执行 `.\.venv\Scripts\Activate.ps1`。
 
 `requirements.txt` 中的 `wxauto4` 使用 Windows 平台标记；在 Linux 上只安装核心测试依赖，不会尝试安装 wxauto4。
 
@@ -147,16 +153,17 @@ wxauto4 基于 UI 自动化，初始化要点头像读资料、轮询要点聊�
 ## 5. 启动
 
 ```powershell
-# 在 Windows 项目根目录
-.\.venv\Scripts\Activate.ps1
-python -m app --instance deepseek-chan
+# 在 Windows 项目根目录，不需要激活虚拟环境
+.\.venv\Scripts\python.exe -m app --instance deepseek-chan
 ```
 
 默认实例就是 `deepseek-chan`，也可以直接：
 
 ```powershell
-python -m app
+.\.venv\Scripts\python.exe -m app
 ```
+
+已经 `Activate.ps1` 之后，写 `python -m app` 也行（此时 `python` 指向 `.venv`）。
 
 正常启动会看到类似日志：
 
@@ -178,12 +185,13 @@ image_followup channel=... message=... attached=1 cached=3  # 追问复用了缓
 wxauto4_poll chat=... rendered=2 unread=1 new=1   # 每轮实际读到的行数/未读数/新消息数
 wxauto4_image_saved source=screenshot ...         # 图片是怎么拿到的
 wxauto4_image_unavailable chat=... sender=...     # 图片没拿到（会回给模型一句提示）
+wxauto4_sent chat=小窝儿 🎵 🎵 🎵 chars=42        # 实际发到了哪个聊天（排查串群）
 ```
 
 查看实例：
 
 ```powershell
-python -m app --list-instances
+.\.venv\Scripts\python.exe -m app --list-instances
 ```
 
 ---
@@ -346,23 +354,42 @@ web_search:
 因此同一账号、同一聊天、同一发送者的长期记忆和冷却状态是稳定的。
 修改微信昵称、群名或备注可能导致对应 ID 变化。
 
+**记忆是「按聊天隔离」的**：`user_id` 里含聊天名，所以同一个人在不同群是不同的 user，
+在 A 群记住的事只会在 A 群被检索到。`memories.channel_id` 记录了记忆来自哪个聊天
+（schema v2 起；旧数据已按 `bot_state` 里的回复记录回填）。
+
 默认只保存长期记忆和 `user_profiles` / `bot_state`，不永久保存全部原始聊天文本。
-短期上下文只存在内存中，进程重启会清空。
+短期对话上下文只存在内存中，进程重启会清空。
+
+**待抽取的消息会落盘**（`pending_messages` 表，schema v3 起）：以前这个队列只在内存里，
+重启就清零，所以经常攒不够 `extraction_threshold` 条、几乎不抽取。现在：
+
+- 别人的文本消息一进来就写入 `pending_messages`，重启后继续累计；
+- 每个聊天最多保留 `pending_max_per_channel` 条（默认 200），超出丢最旧的；
+- 抽取成功后立即删除对应行（真正处理完就不再保留原文）；
+- 不想落盘就设 `memory.persist_pending: false`，回到旧的内存队列行为。
+
+**消息 id 不可比较**：微信 4.x 的消息 id 在本项目里是「内容指纹哈希」，不是递增序号。
+所以抽取游标、消息顺序、`pending_messages` 排序一律使用**接收时间** `created_at`，
+不要用 `message_id` 比大小。
 
 ### 查看已经记住的内容
 
 ```powershell
-python -m app --list-memories
-python -m app --list-memories --memory-limit 100   # 默认显示最近 50 条
+.\.venv\Scripts\python.exe -m app --list-memories
+.\.venv\Scripts\python.exe -m app --list-memories --memory-limit 100    # 默认显示最近 50 条
+.\.venv\Scripts\python.exe -m app --list-memories --memory-chat "老窝🌹🍎🍑💖"  # 只看某个群
 ```
 
-输出包含：数据库路径、账号/人格、用户档案数量、每条记忆的所属用户 id、类别、内容、
-作用域、重要度、置信度、更新时间。没有记忆时会提示「攒够 N 条消息才会抽取一次」。
+输出包含：数据库路径、账号/人格、用户档案数量、**按聊天统计的条数**，
+以及每条记忆的所属聊天 `<>`、用户 id、类别、内容、作用域、重要度、置信度、更新时间。
+
+想确认某个群有没有记忆，就看开头那段「按聊天统计」，或者直接用 `--memory-chat` 过滤。
 
 ### 清除某个用户在某个聊天的记忆
 
 ```powershell
-python -m app --instance deepseek-chan `
+.\.venv\Scripts\python.exe -m app --instance deepseek-chan `
   --purge-user-memory "张三" `
   --chat-name "文件传输助手"
 ```
@@ -370,7 +397,7 @@ python -m app --instance deepseek-chan `
 同时清除 shared 记忆：
 
 ```powershell
-python -m app --instance deepseek-chan `
+.\.venv\Scripts\python.exe -m app --instance deepseek-chan `
   --purge-user-memory "张三" `
   --chat-name "文件传输助手" `
   --include-shared
@@ -394,10 +421,10 @@ Copy-Item data\bot.db data\bot.db.backup
 在 Windows 或 Linux 上都可以运行不依赖 wxauto4 的测试：
 
 ```bash
-python -m pytest
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-当前测试结果：**131 passed, 6 skipped**。
+当前测试结果：**149 passed, 6 skipped**。
 
 测试使用临时 SQLite、Fake Chat Model、Fake Agent/Sender，以及假的 wxauto4 客户端；
 不会访问真实微信或 DeepSeek API。
@@ -496,7 +523,7 @@ $env:WEB_SEARCH_LIVE = "1"
 - 该失败不会中断回复，只是模型拿不到搜索结果。单独验证搜索接口（会真实发一次请求、计费一次）：
 
   ```text
-  python -m app --check-web-search "DeepSeek V4"
+  .\.venv\Scripts\python.exe -m app --check-web-search "DeepSeek V4"
   ```
 
 - 只想关掉联网搜索：从实例 YAML 的 `tools` 列表里删除 `web_search`。
@@ -509,6 +536,9 @@ $env:WEB_SEARCH_LIVE = "1"
 - 仅适配 **wxauto4 / 微信 4.1.x**（验证版本 4.1.8.107），不保证其他 4.x 小版本。
 - 免费版没有 `AddListenChat` / `GetNextNewMessage`（✨Plus 专用），本项目用轮询实现多聊天；
   每轮会切换微信聊天窗口，运行期间不建议同时手动操作微信。
+- `SendMsg(who=...)` 是「先切到该聊天、等输入框、再打字」，而微信窗口是全局共享状态。
+  适配层因此用**一把 UI 互斥锁**串行化所有窗口操作（切聊天 / 读消息 / 截图 / 发送），
+  否则发送过程中的轮询切屏会把回复发到别的聊天（曾出现过「A 群的回复出现在 B 群」）。
 - 轮询只能看到当前聊天窗口里**已渲染**的消息（wxauto4 会把聊天窗口拉高以显示更多），
   一个轮询周期内超出可见范围的消息可能漏掉；启动时已存在的历史消息会被标记为已读，不会回复。
 - 微信 4.x 的运行时消息 id 在切换聊天/重绘后会变化，wxauto4 的 `hash` 又混入了渲染尺寸

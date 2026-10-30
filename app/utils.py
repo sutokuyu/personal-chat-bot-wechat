@@ -32,6 +32,17 @@ def parse_iso(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def try_parse_iso(value: str | None) -> datetime | None:
+    """Parse a timestamp, returning None for legacy or malformed values."""
+
+    if not value:
+        return None
+    try:
+        return parse_iso(value)
+    except ValueError:
+        return None
+
+
 def expires_in(days: int | None, *, now: datetime | None = None) -> str | None:
     if days is None:
         return None

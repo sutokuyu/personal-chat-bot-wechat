@@ -22,7 +22,7 @@ from app.memory.repository import MemoryRepository
 from app.runtime import create_runtime, run_wechat
 from app.storage.database import Database
 from app.tools.web_tools import format_results, search_web
-from app.wxauto_adapter import stable_id, user_id_for
+from app.wxauto_adapter import chat_id_for, stable_id, user_id_for
 
 logger = logging.getLogger("app.main")
 
@@ -71,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         help="how many memories --list-memories prints (default: 50)",
+    )
+    parser.add_argument(
+        "--memory-chat",
+        metavar="CHAT_NAME",
+        help="only show memories from this chat (exact name from the instance config)",
     )
     parser.add_argument(
         "--purge-user-memory",
@@ -151,17 +156,39 @@ def _list_memories(loaded, args) -> int:
     persona_id = loaded.config.persona_id
     limit = max(1, min(int(args.memory_limit), 500))
 
+    chat_names = {
+        str(chat_id_for(wechat.account_id, chat.name)): chat.name
+        for chat in wechat.chats
+    }
+    chat_filter = ""
+    if args.memory_chat:
+        matches = [cid for cid, name in chat_names.items() if name == args.memory_chat]
+        if not matches:
+            print(
+                f"没有配置名为 {args.memory_chat!r} 的聊天。可选："
+                + "、".join(chat_names.values()),
+                file=sys.stderr,
+            )
+            return 2
+        chat_filter = matches[0]
+
+    where_chat = " AND channel_id = ?" if chat_filter else ""
+    params: tuple = (guild_id, persona_id, chat_filter, limit) if chat_filter else (
+        guild_id,
+        persona_id,
+        limit,
+    )
     rows = database.read(
         lambda conn: conn.execute(
-            """
-            SELECT user_id, scope, category, content, importance, confidence,
-                   updated_at, expires_at
+            f"""
+            SELECT user_id, channel_id, scope, category, content, importance,
+                   confidence, updated_at, expires_at
             FROM memories
-            WHERE guild_id = ? AND persona_id = ? AND status = 'active'
+            WHERE guild_id = ? AND persona_id = ? AND status = 'active'{where_chat}
             ORDER BY id DESC
             LIMIT ?
             """,
-            (guild_id, persona_id, limit),
+            params,
         ).fetchall()
     )
     profile = database.read(
@@ -174,6 +201,17 @@ def _list_memories(loaded, args) -> int:
             (guild_id, persona_id),
         ).fetchone()
     )
+    per_chat = database.read(
+        lambda conn: conn.execute(
+            """
+            SELECT channel_id, COUNT(*) AS total
+            FROM memories
+            WHERE guild_id = ? AND persona_id = ? AND status = 'active'
+            GROUP BY channel_id
+            """,
+            (guild_id, persona_id),
+        ).fetchall()
+    )
 
     print(f"数据库：{database.path}")
     print(
@@ -182,6 +220,14 @@ def _list_memories(loaded, args) -> int:
     print(
         f"用户档案：{profile['users']} 人，累计互动 {profile['interactions']} 次"
     )
+    if per_chat:
+        print("\n按聊天统计：")
+        counts = {str(row["channel_id"]): row["total"] for row in per_chat}
+        for cid, name in chat_names.items():
+            print(f"  {name}：{counts.get(cid, 0)} 条")
+        unknown = counts.get("", 0)
+        if unknown:
+            print(f"  （旧数据，无聊天归属）：{unknown} 条")
     if not rows:
         print("\n暂无长期记忆。")
         print(
@@ -190,11 +236,14 @@ def _list_memories(loaded, args) -> int:
         )
         return 0
 
-    print(f"\n共 {len(rows)} 条长期记忆（最近的在最前）：")
+    heading = f"\n{args.memory_chat} 共 {len(rows)} 条" if chat_filter else f"\n共 {len(rows)} 条"
+    print(f"{heading}长期记忆（最近的在最前）：")
     for index, row in enumerate(rows, start=1):
         expiry = f" / 到期 {_local_time(row['expires_at'])}" if row["expires_at"] else ""
+        chat_label = chat_names.get(str(row["channel_id"]), "（旧数据）")
         print(
-            f"{index:>3}. [{row['user_id']}] {row['category']:<12} {row['content']}\n"
+            f"{index:>3}. [{row['user_id']}] {row['category']:<12} "
+            f"<{chat_label}> {row['content']}\n"
             f"     scope={row['scope']} 重要度={row['importance']:.2f} "
             f"置信度={row['confidence']:.2f} 更新于 {_local_time(row['updated_at'])}{expiry}"
         )

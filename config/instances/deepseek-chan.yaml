@@ -61,10 +61,15 @@ web_search:
 memory:
   enabled: true
   allow_shared_memory: false
-  extraction_threshold: 10
+  # 每个聊天攒够这么多条（未抽取的）消息就跑一次记忆抽取；重启后不会清零。
+  extraction_threshold: 5
   extraction_batch_size: 18
   extraction_max_attempts: 3
   extraction_timeout_seconds: 90
+  # 待抽取的消息会存进数据库（pending_messages 表），进程重启后继续累计。
+  # 设为 false 则回到「只在内存里」的旧行为。
+  persist_pending: true
+  pending_max_per_channel: 200
   max_memories_per_search: 5
   max_memory_chars: 500
   min_importance: 0.35

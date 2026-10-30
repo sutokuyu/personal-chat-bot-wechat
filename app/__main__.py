@@ -1,3 +1,3 @@
-from app.main import main
+from app.bootstrap import run
 
-raise SystemExit(main())
+raise SystemExit(run())

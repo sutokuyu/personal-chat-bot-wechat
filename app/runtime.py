@@ -35,10 +35,11 @@ from app.participation_gate import (
     ParticipationJudge,
 )
 from app.storage.database import Database
+from app.storage.pending_messages import PendingMessageStore
 from app.tools.context import AgentRuntimeContext
 from app.tools.registry import build_tools, validate_tool_names
 from app.vision import ImageDescriber
-from app.wxauto_adapter import WxAutoAdapter, chat_id_for
+from app.wxauto_adapter import WxAutoAdapter, chat_id_for, stable_id
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +108,22 @@ class BotRuntime:
         )
         self.repository = MemoryRepository(self.database, self.policy)
         self.state = BotStateRepository(self.database)
+        pending_store = (
+            PendingMessageStore(
+                self.database,
+                max_per_channel=self.config.memory.pending_max_per_channel,
+            )
+            if self.config.memory.enabled and self.config.memory.persist_pending
+            else None
+        )
+        self.pending_store = pending_store
         self.context = context_manager or ContextManager(
             max_messages=self.config.context.max_messages,
             track_extraction=self.config.memory.enabled,
+            pending_store=pending_store,
         )
+        if pending_store is not None:
+            self._restore_pending_messages()
         cooldowns = CooldownStore(self.state, self.config.instance_id)
         self.gate = ParticipationGate(
             instance_id=self.config.instance_id,
@@ -153,6 +166,27 @@ class BotRuntime:
 
     def set_sender(self, sender: ReplySender) -> None:
         self.sender = sender
+
+    def _restore_pending_messages(self) -> None:
+        """Reload messages a previous process had not extracted yet."""
+
+        account_id = self.config.wechat.account_id
+        guild_id = stable_id("account", account_id)
+        for chat in self.config.wechat.chats:
+            key = (guild_id, chat_id_for(account_id, chat.name))
+            cursor = self.state.get_extraction_cursor(
+                self.config.instance_id, str(key[1])
+            )
+            messages = self.pending_store.load(key, after=cursor)
+            if not messages:
+                continue
+            restored = self.context.hydrate_extraction_buffer(key, messages)
+            if restored:
+                self.logger.info(
+                    "pending_messages_restored chat=%s messages=%d",
+                    chat.name,
+                    restored,
+                )
 
     def _lock_for(self, key: tuple[int, int]) -> asyncio.Lock:
         lock = self._channel_locks.get(key)
@@ -405,7 +439,7 @@ class BotRuntime:
         recent = [
             item
             for item in self.context.recent(message.key)
-            if item.message_id <= message.message_id
+            if item.created_at <= message.created_at
         ]
         attached: list[CachedImage] = []
         image_context = ""
