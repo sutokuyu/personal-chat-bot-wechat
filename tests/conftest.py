@@ -90,11 +90,13 @@ class FakeJudge:
     )
     calls: int = 0
     image_contexts: list[str] = field(default_factory=list)
+    recent_reply_hints: list[str] = field(default_factory=list)
 
     async def judge(
         self, transcript: str, current: IncomingMessage, **kwargs
     ):
         self.image_contexts.append(kwargs.get("image_context", ""))
+        self.recent_reply_hints.append(kwargs.get("recent_reply_hint", ""))
         decision = self.decisions[min(self.calls, len(self.decisions) - 1)]
         self.calls += 1
         return decision
@@ -116,7 +118,24 @@ class FakeExtractionRunner:
 
 
 def make_loaded(instance_id: str = "deepseek-chan"):
-    return load_instance(instance_id)
+    """Load a real instance, but with deterministic gate tuning.
+
+    The shipped instance config is deliberately conservative for production
+    (low reply probability, interest threshold, topic window). Tests assert
+    routing and effects, so they start from permissive values; the production
+    numbers themselves are covered by test_config.py.
+    """
+
+    loaded = load_instance(instance_id)
+    participation = loaded.config.participation.model_copy(
+        update={
+            "reply_probability": 1.0,
+            "min_interest": 0.0,
+            "topic_window_seconds": 0.0,
+        }
+    )
+    config = loaded.config.model_copy(update={"participation": participation})
+    return loaded.model_copy(update={"config": config})
 
 
 def make_database(tmp_path: Path) -> Database:

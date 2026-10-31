@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 class ParticipationDecision(BaseModel):
     should_reply: bool
+    # 0..1: how much this persona would care about the topic as a person. The
+    # gate drops low-interest messages even when ``should_reply`` is true, so
+    # the judge can be generous and the threshold does the filtering.
+    interest: float = 0.5
     reason: str = Field(default="", max_length=300)
 
 
@@ -51,10 +55,23 @@ class ParticipationJudge(Protocol):
         current: IncomingMessage,
         *,
         image_context: str = "",
+        recent_reply_hint: str = "",
     ) -> ParticipationDecision: ...
 
 
 _JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
+
+
+def _as_score(value: object, default: float = 0.5) -> float:
+    """Coerce a model-provided interest score into 0..1, falling back safely."""
+
+    try:
+        score = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if score != score:  # NaN
+        return default
+    return max(0.0, min(1.0, score))
 
 
 def parse_decision_text(text: str) -> ParticipationDecision:
@@ -67,6 +84,7 @@ def parse_decision_text(text: str) -> ParticipationDecision:
             if isinstance(payload, dict) and "should_reply" in payload:
                 return ParticipationDecision(
                     should_reply=bool(payload["should_reply"]),
+                    interest=_as_score(payload.get("interest")),
                     reason=str(payload.get("reason", ""))[:300],
                 )
         except (json.JSONDecodeError, ValueError):
@@ -103,9 +121,14 @@ class LLMParticipationJudge:
         current: IncomingMessage,
         *,
         image_context: str = "",
+        recent_reply_hint: str = "",
     ) -> ParticipationDecision:
         system, user = build_participation_prompt(
-            self.persona_prompt, transcript, current, image_context=image_context
+            self.persona_prompt,
+            transcript,
+            current,
+            image_context=image_context,
+            recent_reply_hint=recent_reply_hint,
         )
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
         try:
@@ -141,6 +164,7 @@ class CooldownStore:
     _CHANNEL_KEY = "cooldown_channel"
     _USER_KEY = "cooldown_user"
     _LAST_REPLY_KEY = "last_bot_reply"
+    _LAST_TEXT_KEY = "last_bot_reply_text"
 
     def __init__(self, state: BotStateRepository, instance_id: str) -> None:
         self.state = state
@@ -173,10 +197,10 @@ class CooldownStore:
         )
         return self._remaining(last, seconds, now or utcnow())
 
-    def record_reply(self, message: IncomingMessage, *, now: datetime | None = None) -> None:
+    def record_reply(self, message: IncomingMessage, *, text: str = "") -> None:
         from app.utils import isoformat
 
-        timestamp = isoformat(now or utcnow())
+        timestamp = isoformat(utcnow())
         self.state.set_value(
             self.instance_id,
             self._CHANNEL_KEY,
@@ -199,6 +223,26 @@ class CooldownStore:
             channel_id=str(message.channel_id),
             user_id=str(message.author_id),
         )
+        # Channel-scoped copy of the wording, so the participation judge can be
+        # told what the persona just said about the topic.
+        self.state.set_value(
+            self.instance_id,
+            self._LAST_TEXT_KEY,
+            text[:600],
+            guild_id=str(message.guild_id),
+            channel_id=str(message.channel_id),
+        )
+
+    def last_reply_hint(self, message: IncomingMessage) -> str:
+        """What the persona said last in this channel (empty when unknown)."""
+
+        value = self.state.get_value(
+            self.instance_id,
+            self._LAST_TEXT_KEY,
+            guild_id=str(message.guild_id),
+            channel_id=str(message.channel_id),
+        )
+        return value or ""
 
     def is_continuation(
         self,
@@ -338,11 +382,36 @@ class ParticipationGate:
             return GateDecision(True, "conversation continuation", forced=True)
         if not self.participation.enabled or self.judge is None:
             return GateDecision(False, "participation judgement disabled")
+
+        # A topic the persona just answered gets roughly one reply, not one per
+        # message: several people reacting to the same thing should not each
+        # trigger an answer. Mentions and direct continuations bypass this.
+        topic_wait = 0.0
+        recent_reply_hint = ""
+        if (
+            not message.is_bot
+            and self.participation.topic_window_seconds > 0
+            and not message.is_mention
+        ):
+            topic_wait = await asyncio.to_thread(
+                self.cooldowns.channel_remaining,
+                message,
+                self.participation.topic_window_seconds,
+            )
+            if topic_wait > 0:
+                recent_reply_hint = await asyncio.to_thread(
+                    self.cooldowns.last_reply_hint, message
+                )
+
         probability = (
             self.participation.bot_reply_probability
             if message.is_bot
             else self.participation.reply_probability
         )
+        if topic_wait > 0:
+            probability = min(
+                probability, self.participation.topic_window_reply_probability
+            )
         if probability <= 0.0:
             return GateDecision(False, "participation probability is zero")
 
@@ -351,10 +420,21 @@ class ParticipationGate:
             limited, merge_window_seconds=self.merge_window_seconds
         )
         decision = await self.judge.judge(
-            transcript, message, image_context=image_context
+            transcript,
+            message,
+            image_context=image_context,
+            recent_reply_hint=recent_reply_hint,
         )
         if not decision.should_reply:
             return GateDecision(False, decision.reason or "model decision")
+
+        interest = _as_score(decision.interest)
+        if interest < self.participation.min_interest:
+            return GateDecision(
+                False,
+                f"interest {interest:.2f} below {self.participation.min_interest:.2f}"
+                + (f": {decision.reason}" if decision.reason else ""),
+            )
 
         # Even a suitable message should not always trigger a reply. Apply the
         # probabilistic throttle after the judge so unsuitable messages stay
@@ -364,12 +444,14 @@ class ParticipationGate:
             if draw >= probability:
                 return GateDecision(
                     False,
-                    f"participation probability skipped (p={probability:.2f})",
+                    f"participation probability skipped (p={probability:.2f}"
+                    + (", topic window" if topic_wait > 0 else "")
+                    + ")",
                 )
         return GateDecision(True, decision.reason or "model decision")
 
-    async def record_reply(self, message: IncomingMessage) -> None:
-        await asyncio.to_thread(self.cooldowns.record_reply, message)
+    async def record_reply(self, message: IncomingMessage, *, text: str = "") -> None:
+        await asyncio.to_thread(self.cooldowns.record_reply, message, text=text)
 
     async def claim_reply(self, message: IncomingMessage) -> bool:
         """Claim this message across persona processes sharing the database."""

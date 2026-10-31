@@ -231,3 +231,171 @@ def test_transcript_marks_self_reply_as_you():
     rendered = render_transcript(context.recent((100, 200)), merge_window_seconds=0)
     assert f"[{own.message_id}]" in rendered
     assert "[you]" in rendered
+
+
+async def test_low_interest_message_is_silenced_even_if_judge_says_reply(tmp_path):
+    judge = FakeJudge(
+        decisions=[
+            ParticipationDecision(should_reply=True, interest=0.2, reason="meh")
+        ]
+    )
+    gate, _context, _state, _cooldowns = _gate(
+        tmp_path,
+        judge=judge,
+        participation=ParticipationConfig(min_interest=0.55),
+    )
+    decision = await gate.evaluate(make_message(70, content="几点了"), recent=[])
+    assert not decision.should_reply
+    assert "interest 0.20" in decision.reason
+
+
+async def test_topic_window_blocks_a_second_person_on_the_same_topic(tmp_path):
+    judge = FakeJudge()
+    gate, _context, _state, _cooldowns = _gate(
+        tmp_path,
+        judge=judge,
+        participation=ParticipationConfig(
+            topic_window_seconds=120, topic_window_reply_probability=0.0
+        ),
+        reply=ReplyConfig(channel_cooldown_seconds=0, user_cooldown_seconds=0),
+    )
+    first = make_message(80, content="今晚吃什么", author_id=300)
+    await gate.record_reply(first, text="吃面吧")
+
+    second = make_message(81, content="我也想吃面", author_id=301)
+    decision = await gate.evaluate(second, recent=[first, second])
+
+    assert not decision.should_reply
+    assert judge.calls == 0
+
+
+async def test_topic_window_passes_what_the_persona_just_said_to_the_judge(tmp_path):
+    judge = FakeJudge()
+    gate, _context, _state, _cooldowns = _gate(
+        tmp_path,
+        judge=judge,
+        participation=ParticipationConfig(
+            topic_window_seconds=120, topic_window_reply_probability=1.0
+        ),
+        reply=ReplyConfig(channel_cooldown_seconds=0, user_cooldown_seconds=0),
+    )
+    first = make_message(90, content="今晚吃什么", author_id=300)
+    await gate.record_reply(first, text="吃面吧")
+
+    second = make_message(91, content="那家面馆关门了", author_id=301)
+    decision = await gate.evaluate(second, recent=[first, second])
+
+    assert decision.should_reply
+    assert judge.recent_reply_hints[-1] == "吃面吧"
+
+
+async def test_mention_bypasses_topic_window(tmp_path):
+    judge = FakeJudge()
+    gate, _context, _state, _cooldowns = _gate(
+        tmp_path,
+        judge=judge,
+        participation=ParticipationConfig(
+            topic_window_seconds=120, topic_window_reply_probability=0.0
+        ),
+        reply=ReplyConfig(channel_cooldown_seconds=0, user_cooldown_seconds=0),
+    )
+    first = make_message(95, content="今晚吃什么", author_id=300)
+    await gate.record_reply(first, text="吃面吧")
+
+    mention = make_message(
+        96, content="@DeepSeek-chan 你说呢", author_id=301, is_mention=True
+    )
+    decision = await gate.evaluate(mention, recent=[first, mention])
+
+    assert decision.should_reply and decision.forced
+
+
+async def test_long_reply_is_sent_as_several_bubbles(tmp_path):
+    text = "第一句话在这里说完了，还有一点补充。第二句话接着说，别担心。"
+    loaded = make_loaded("deepseek-chan")
+    reply = loaded.config.reply.model_copy(
+        update={
+            "split_replies": True,
+            "split_min_chars": 20,
+            "split_max_parts": 3,
+            "split_probability": 1.0,
+            "split_gap_min_seconds": 0.0,
+            "split_gap_max_seconds": 0.0,
+        }
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"reply": reply})}
+    )
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=FakeAgentRunner(result=AgentResult(text=text)),
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+        random_fn=lambda: 0.0,
+    )
+    await runtime.handle_message(make_message(30, content="hi", is_mention=True))
+
+    assert len(sender.sent) >= 2
+    assert "".join(part["text"] for part in sender.sent) == text
+    stored = [item for item in runtime.context.recent((100, 200)) if item.is_self]
+    assert stored and stored[-1].content == text
+    await runtime.close()
+
+
+async def test_model_chosen_split_points_win_over_the_heuristic(tmp_path):
+    text = "等我一下。<split/>我去看看那个文件。"
+    loaded = make_loaded("deepseek-chan")
+    reply = loaded.config.reply.model_copy(
+        update={
+            "split_replies": True,
+            "split_min_chars": 1000,  # heuristic would never split
+            "split_probability": 0.0,
+            "split_gap_min_seconds": 0.0,
+            "split_gap_max_seconds": 0.0,
+        }
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"reply": reply})}
+    )
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=FakeAgentRunner(result=AgentResult(text=text)),
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+    )
+    await runtime.handle_message(make_message(31, content="hi", is_mention=True))
+
+    assert [part["text"] for part in sender.sent] == [
+        "等我一下。",
+        "我去看看那个文件。",
+    ]
+    assert all("<split" not in part["text"] for part in sender.sent)
+    await runtime.close()
+
+
+async def test_split_markers_never_leak_when_splitting_is_disabled(tmp_path):
+    text = "等我一下。<split/>我去看看那个文件。"
+    loaded = make_loaded("deepseek-chan")
+    reply = loaded.config.reply.model_copy(update={"split_replies": False})
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"reply": reply})}
+    )
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=FakeAgentRunner(result=AgentResult(text=text)),
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+    )
+    await runtime.handle_message(make_message(32, content="hi", is_mention=True))
+
+    assert [part["text"] for part in sender.sent] == ["等我一下。我去看看那个文件。"]
+    await runtime.close()

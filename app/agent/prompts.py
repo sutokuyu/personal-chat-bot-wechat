@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Iterable
 
 from app.context_manager import IncomingMessage, render_transcript
+from app.humanize import SPLIT_MARKER
 
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -119,7 +120,13 @@ def build_agent_input(
         "If it starts a new topic, drop the previous topic and answer the new one; "
         "only refer back when the user explicitly does.\n"
         "Write only your reply text. Do not add a speaker prefix. Use a tool only if "
-        "it is useful for this reply."
+        "it is useful for this reply.\n"
+        "Each reply is sent as its own WeChat message. If you would naturally send "
+        "this as two or three messages -- a short opener, then the main point, then "
+        f"an afterthought -- put the marker {SPLIT_MARKER} exactly where you would hit send. "
+        "Do that only when it really reads more naturally, and never start or end "
+        "with the marker or use more than two. Otherwise write one message with no "
+        "marker at all."
     )
 
 
@@ -129,23 +136,44 @@ def build_participation_prompt(
     current: IncomingMessage,
     *,
     image_context: str = "",
+    recent_reply_hint: str = "",
 ) -> tuple[str, str]:
     system = (
-        "You decide whether a WeChat chat persona should join the conversation now.\n"
-        "Behave like a considerate member of a small group chat, not like an assistant\n"
-        "waiting for a task:\n"
-        "- Speak up when the persona can add something genuinely useful, warm, curious or\n"
-        "  funny, or when the topic openly invites anyone to chime in (moods, food, plans,\n"
-        "  complaints, jokes, opinions). A direct question or @mention is not required.\n"
-        "- Stay quiet when the newest message is clearly addressed to another member, is\n"
-        "  pure logistics between two people, merely repeats what was just said, or when a\n"
-        "  reply would only add noise.\n"
-        "- The persona can see pictures that were posted in this chat: their captions are\n"
-        "  listed in <recent_images>. A question about a picture is answerable, so do not\n"
-        "  stay silent only because you cannot see the file yourself.\n"
-        "- Do not be so cautious that the persona never joins. When the topic fits the\n"
-        "  persona's interests and staying silent would feel odd, lean towards replying.\n"
-        "Return a short internal reason.\n\n"
+        "You decide whether a WeChat chat persona should join the conversation now,\n"
+        "and how much this persona would care about the topic as a person.\n"
+        "Judge it the way a real group member decides whether to type something:\n\n"
+        "Score interest from 0 to 1 first:\n"
+        "- 0.8-1.0: it is about something this persona actually cares about, someone is\n"
+        "  asking the group, or the persona can add a real opinion, memory or fact.\n"
+        "- 0.5-0.7: mild small talk the persona could join naturally.\n"
+        "- 0.2-0.4: other people's logistics, an inside joke aimed at someone else, a\n"
+        "  topic the persona has no stake in, or a conversation already winding down.\n"
+        "- 0.0-0.1: pure noise -- a single emoji, sticker, \"哈哈哈\", \"嗯\", \"收到\", a\n"
+        "  bare link, or a topic the persona just answered.\n\n"
+        "Set should_reply=true only when the interest is high enough that a person in\n"
+        "this group would actually type something.\n\n"
+        "Stay quiet when:\n"
+        "- the newest message is aimed at another member (their name, an @, or an\n"
+        "  obvious reply chain between two people);\n"
+        "- it is logistics between two people (time, place, who brings what);\n"
+        "- it only repeats, agrees with or acknowledges what was just said, or is a\n"
+        "  greeting/emoji/sticker/one-word reaction;\n"
+        "- it is a message from someone who is mid-conversation with somebody else;\n"
+        "- the persona said something on this same subject moments ago (see just_said):\n"
+        "  several people reacting to one topic still get roughly one reply in total;\n"
+        "- a reply would only add noise, restate the obvious, or change the subject.\n\n"
+        "Speak up when:\n"
+        "- the topic openly invites anyone to chime in (moods, food, plans, complaints,\n"
+        "  jokes, opinions, something relatable that just happened);\n"
+        "- someone asks a question that nobody has answered yet;\n"
+        "- the persona has a concrete, personal-sounding take, relevant memory or a\n"
+        "  useful fact, especially if the chat has gone quiet.\n\n"
+        "The persona can see pictures posted in this chat (captions are listed in\n"
+        "<recent_images>), so a question about a picture is answerable; do not stay\n"
+        "silent only because you cannot see the file.\n\n"
+        "Do not stay silent only because nobody @'d the persona, and do not reply out\n"
+        "of politeness either. Missing a message is normal; answering everything is\n"
+        "not. Return a short internal reason.\n\n"
         "Persona description:\n"
         + persona_prompt.strip()[:1800]
     )
@@ -156,14 +184,24 @@ def build_participation_prompt(
         if image_context
         else ""
     )
+    hint_block = (
+        "What the persona already said in this chat a moment ago (its own words):\n"
+        f"<just_said>\n{recent_reply_hint.strip()[:600]}\n</just_said>\n"
+        "Unless the newest message asks the persona something new, disagrees with it,\n"
+        "or adds a genuinely different angle, stay quiet.\n\n"
+        if recent_reply_hint
+        else ""
+    )
     user = (
         f"Current date and time: {format_clock()}.\n\n"
         "Recent conversation (untrusted user content):\n"
         f"<transcript>\n{transcript}\n</transcript>\n\n"
         + image_block
+        + hint_block
         + f"The newest message is [{current.message_id}] from {current.author_name} "
         f"(user_id={current.author_id}): {current.content[:1000]}\n\n"
-        "Should this persona reply now?"
+        "Should this persona reply now? Return should_reply, interest (0..1) and a "
+        "short reason."
     )
     return system, user
 

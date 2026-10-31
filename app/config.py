@@ -62,7 +62,24 @@ class WeChatConfig(StrictModel):
     account_id: str = Field(default="wechat-main", min_length=1, max_length=64)
     chats: list[WeChatChatConfig] = Field(min_length=1)
     poll_interval_seconds: float = Field(default=1.0, ge=0.2, le=30.0)
-    send_delay_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
+    # Random +/- ratio applied to every poll interval so window switches do not
+    # land on a perfectly regular beat.
+    poll_jitter_ratio: float = Field(default=0.35, ge=0.0, le=0.9)
+    # After this many polls the account "walks away" for a random pause, which
+    # is what a human-driven client looks like over a whole day.
+    poll_burst_size: int = Field(default=30, ge=1, le=1000)
+    poll_pause_min_seconds: float = Field(default=10.0, ge=0.0, le=1800.0)
+    poll_pause_max_seconds: float = Field(default=45.0, ge=0.0, le=3600.0)
+    # Base delay before a send: the time the persona spends reading/typing.
+    # 0 disables the whole simulated-typing delay (including per-char/jitter).
+    send_delay_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    # Extra delay per character, so long replies take longer to type out.
+    send_delay_per_char_seconds: float = Field(default=0.05, ge=0.0, le=1.0)
+    # Uniform extra seconds on top, to avoid identical reaction times.
+    send_delay_jitter_seconds: float = Field(default=1.5, ge=0.0, le=30.0)
+    send_delay_max_seconds: float = Field(default=25.0, ge=0.0, le=120.0)
+    # Short pause after a successful send before the next action.
+    send_gap_seconds: float = Field(default=0.6, ge=0.0, le=30.0)
     bot_name: str | None = Field(default=None, max_length=100)
     text_only: bool = True
     # Download image messages and let the bot look at them. Other non-text
@@ -154,6 +171,16 @@ class ReplyConfig(StrictModel):
     # cooldown expires, so one chatty user cannot starve the rest of the chat.
     retry_on_cooldown: bool = True
     max_cooldown_retry_seconds: float = Field(default=15.0, ge=0.0, le=300.0)
+    # Simulate a person typing: long replies are sent as two or three separate
+    # bubbles with a random pause in between instead of one wall of text.
+    # Split points come from the model's own ``<split/>`` markers; these knobs
+    # tune the punctuation-based fallback used when it emitted none.
+    split_replies: bool = True
+    split_min_chars: int = Field(default=160, ge=20, le=2000)
+    split_max_parts: int = Field(default=3, ge=2, le=6)
+    split_probability: float = Field(default=0.8, ge=0.0, le=1.0)
+    split_gap_min_seconds: float = Field(default=0.8, ge=0.0, le=30.0)
+    split_gap_max_seconds: float = Field(default=3.0, ge=0.0, le=60.0)
     empty_reply_fallback: str = Field(
         default="（不知道该说什么……先听你们聊。）",
         max_length=200,
@@ -174,6 +201,15 @@ class ParticipationConfig(StrictModel):
     # Applied only to non-mention messages that the judge approved. 1.0 means
     # always reply when approved; 0.0 means never reply without a mention.
     reply_probability: float = Field(default=1.0, ge=0.0, le=1.0)
+    # The judge also scores how much this persona would care about the topic.
+    # Messages scoring below this are dropped even when the judge said "reply",
+    # which keeps the bot out of conversations a person would not join.
+    min_interest: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Topic-level throttle: for this many seconds after a reply, other people
+    # talking about the same thing only get through with a low probability, so
+    # one topic gets roughly one reply instead of one per message.
+    topic_window_seconds: float = Field(default=0.0, ge=0.0, le=3600.0)
+    topic_window_reply_probability: float = Field(default=0.15, ge=0.0, le=1.0)
     # If a message @s someone else but not this bot, stay out of the conversation.
     ignore_other_mentions: bool = True
     # Treat other bots as users: let their messages reach the participation judge

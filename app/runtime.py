@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -20,6 +21,13 @@ from app.errors import (
     AgentExecutionError,
     AgentTimeoutError,
     AgentToolLimitError,
+)
+from app.humanize import (
+    drop_dangling_marker,
+    gap_seconds,
+    parse_marked_reply,
+    split_reply,
+    strip_split_markers,
 )
 from app.memory.access_policy import MemoryAccessPolicy
 from app.memory.extractor import (
@@ -93,6 +101,7 @@ class BotRuntime:
         context_manager: ContextManager | None = None,
         image_describer: ImageDescriber | None = None,
         logger_: logging.Logger | None = None,
+        random_fn: Callable[[], float] | None = None,
     ) -> None:
         self.loaded = loaded
         self.config = loaded.config
@@ -101,6 +110,7 @@ class BotRuntime:
         self.sender = sender
         self.agent_runner = agent_runner
         self.image_describer = image_describer
+        self._random = random_fn or random.random
         self.database = database or Database(loaded.database_path)
         self.database.initialize()
         self.policy = MemoryAccessPolicy(
@@ -553,27 +563,23 @@ class BotRuntime:
             if self.sender is None:
                 self.logger.error("reply_not_sent reason=no_sender")
                 return
-            sent = await self.sender.send_reply(
-                channel_id=message.channel_id,
-                guild_id=message.guild_id,
-                text=text,
-                reference_message_id=message.message_id,
-            )
+            sent, sent_text, parts = await self._send_parts(message, text)
             if sent:
                 self.context.add_bot_reply(
                     guild_id=message.guild_id,
                     channel_id=message.channel_id,
                     author_name=self.config.persona_id,
-                    content=text,
+                    content=sent_text,
                 )
                 keep_claim = True
-                await self.gate.record_reply(message)
+                await self.gate.record_reply(message, text=sent_text)
             self.logger.info(
-                "reply_finished instance=%s message=%s sent=%s chars=%s tools=%s",
+                "reply_finished instance=%s message=%s sent=%s chars=%s parts=%d tools=%s",
                 self.config.instance_id,
                 message.message_id,
                 sent,
-                len(text),
+                len(sent_text),
+                parts,
                 ",".join(result.tool_calls) or "-",
             )
         finally:
@@ -583,6 +589,62 @@ class BotRuntime:
                 except Exception:
                     self.logger.exception("message_claim_release_failed")
 
+    async def _send_parts(
+        self, message: IncomingMessage, text: str
+    ) -> tuple[bool, str, int]:
+        """Send a reply, split into 2-3 bubbles with human-ish pauses.
+
+        Split points come from the model's own ``<split/>`` markers when it
+        emitted any (it knows where the thought breaks); otherwise the
+        punctuation heuristic decides. Returns ``(any_sent, text_that_was_sent,
+        part_count)``. A failed part stops the rest: sending the tail without
+        the head reads worse than stopping, and the claim is released so a
+        retry can happen.
+        """
+
+        reply = self.config.reply
+        sender = self.sender
+        if sender is None:
+            return False, "", 0
+
+        if reply.split_replies:
+            parts, marked = parse_marked_reply(
+                text, max_parts=reply.split_max_parts
+            )
+            if not marked:
+                parts = split_reply(
+                    strip_split_markers(text),
+                    min_chars=reply.split_min_chars,
+                    max_parts=reply.split_max_parts,
+                    probability=reply.split_probability,
+                    rand=self._random,
+                )
+        else:
+            parts = [strip_split_markers(text)]
+        parts = [part for part in parts if part]
+        if not parts:
+            return False, "", 0
+        sent_parts: list[str] = []
+        for index, part in enumerate(parts):
+            if index:
+                await asyncio.sleep(
+                    gap_seconds(
+                        reply.split_gap_min_seconds,
+                        reply.split_gap_max_seconds,
+                        rand=self._random,
+                    )
+                )
+            ok = await sender.send_reply(
+                channel_id=message.channel_id,
+                guild_id=message.guild_id,
+                text=part,
+                reference_message_id=message.message_id,
+            )
+            if not ok:
+                break
+            sent_parts.append(part)
+        return bool(sent_parts), "".join(sent_parts), len(sent_parts)
+
     def _sanitize_reply(self, text: str) -> str:
         text = (text or "").strip()
         if text.startswith("[") and text.endswith("]"):
@@ -591,7 +653,8 @@ class BotRuntime:
         text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
         text = text.replace("@所有人", "@\u200b所有人")
         limit = self.config.reply.max_reply_length
-        return text[:limit].rstrip()
+        # Truncation can land inside a <split/> marker; never send the fragment.
+        return drop_dangling_marker(text[:limit].rstrip())
 
     async def close(self) -> None:
         tasks = list(self._retry_tasks.values())

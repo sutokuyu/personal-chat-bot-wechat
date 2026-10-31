@@ -21,7 +21,19 @@ wechat:
       # image_cache_size: 20
 
   poll_interval_seconds: 1.0
+  # 轮询节奏抖动：窗口切换不要精确到毫秒，±35% 随机。
+  poll_jitter_ratio: 0.35
+  # 每轮询这么多次“离开一会儿”，模拟人不在电脑前。
+  poll_burst_size: 30
+  poll_pause_min_seconds: 10
+  poll_pause_max_seconds: 45
+  # 发送前先“读+打字”的延时（秒）：基准 + 每字 + 随机抖动，0 = 关闭整套延时。
   send_delay_seconds: 1.0
+  send_delay_per_char_seconds: 0.05
+  send_delay_jitter_seconds: 1.5
+  send_delay_max_seconds: 25
+  # 一次发送完成后的小停顿。
+  send_gap_seconds: 0.6
   # Optional. If omitted, the logged-in WeChat nickname is used for @ detection.
   bot_name: null
   text_only: true
@@ -91,6 +103,13 @@ reply:
   retry_on_cooldown: true
   max_cooldown_retry_seconds: 15
   max_reply_length: 1800
+  # 长回复拆成 2~3 条分开发，中间随机停顿，像人打字后分句发。
+  split_replies: true
+  split_min_chars: 160
+  split_max_parts: 3
+  split_probability: 0.8
+  split_gap_min_seconds: 0.8
+  split_gap_max_seconds: 3.0
   # Single account: no cross-instance claim is needed.
   claim_message_across_instances: false
   message_claim_ttl_seconds: 120
@@ -101,9 +120,14 @@ context:
 
 participation:
   enabled: true
-  # 判断器通过后再掷一次骰子；1.0 = 完全交给判断器决定（推荐起始值）。
-  # 调到 0.35 这类低值会把 judge 认可的消息再砍掉 65%，看起来就像「不 @ 不说话」。
-  reply_probability: 1.0
+  # 判断器通过后再掷一次骰子。不是 @ 的时候大部分时间应保持沉默。
+  reply_probability: 0.2
+  # 判断器同时给出 0~1 的“兴趣分”；低于这个分就算它说该回也不回。
+  min_interest: 0.55
+  # 话题级限流：刚回过的这几秒内，别人继续聊同一话题基本不再插话，
+  # 于是一个话题大致只回一次，而不是每个人每条都回。
+  topic_window_seconds: 120
+  topic_window_reply_probability: 0.15
   ignore_other_mentions: true
   # WeChat cannot reliably distinguish bots from humans; these options are
   # retained for future use and currently have no practical effect.

@@ -97,7 +97,15 @@ wechat:
       # image_cache_size: 20
 
   poll_interval_seconds: 1.0
-  send_delay_seconds: 1.0
+  poll_jitter_ratio: 0.35          # 每次轮询 ±35% 随机抖动
+  poll_burst_size: 30              # 轮询这么多次后“离开一会儿”
+  poll_pause_min_seconds: 10
+  poll_pause_max_seconds: 45
+  send_delay_seconds: 1.0          # 发送前的基准“读+打字”延时，0 = 关闭整套延时
+  send_delay_per_char_seconds: 0.05  # 每字追加的延时
+  send_delay_jitter_seconds: 1.5   # 额外随机犹豫时间
+  send_delay_max_seconds: 25
+  send_gap_seconds: 0.6            # 一条发完后的小停顿
   bot_name: null
   text_only: true
   capture_images: true          # 看图（见下）
@@ -113,7 +121,11 @@ wechat:
 - `kind: group`：群聊。只有内容中出现 `@Bot昵称` 时才作为直接提及；其他消息走参与判断和回复概率。
 - `bot_name`：可选。省略时使用当前登录微信账号的昵称。群聊 @ 检测依赖它。\n  如果你在群里的昵称/群备注与账号昵称不同，请显式填写群里显示的名字。
 - `poll_interval_seconds`：轮询间隔（秒），建议 1 秒。配置了 N 个聊天时，每轮会依次切换这 N 个窗口。
-- `send_delay_seconds`：每次发送后的等待时间，避免操作过快。
+  `poll_jitter_ratio` 会给每次间隔加随机抖动；每 `poll_burst_size` 轮再随机停
+  `poll_pause_min/max_seconds`，避免窗口切换精确得像机器。
+- `send_delay_seconds`：发送前的“读消息 + 打字”基准延时；实际延时 =
+  `send_delay_seconds + send_delay_per_char_seconds × 字数 + 随机抖动`，上限
+  `send_delay_max_seconds`。设成 `0` 会关闭整套延时（含每字耗时与抖动）。
 - `text_only: true`：只处理文本，跳过文件、语音、链接等消息。
 - `capture_images: true`：处理图片消息（`text_only` 不影响图片开关）。每张图会：
   1. 在切换聊天前立刻保存下来（wxauto4 的消息控件一旦重绘就失效）；
@@ -211,11 +223,14 @@ wxauto4_sent chat=小窝儿 🎵 🎵 🎵 chars=42        # 实际发到了哪�
    - 如果消息 @ 了别人：默认跳过（`ignore_other_mentions: true`）。
    - 否则由 Participation Gate 的 LLM 判断是否适合参与（像群成员一样判断话题是否插得上话，
      不要求被 @ 或被提问）。
+   - 判断器同时给出 0~1 的**兴趣分**：低于 `min_interest` 就直接不回，即使判断器说“可以回”。
    - 判断通过后再按 `reply_probability` 决定是否真正回复。
+   - 回复后 `topic_window_seconds` 内，同一聊天里的其他人继续聊同样的话题基本不再插话，
+     于是一个话题大致只回一次，而不是每人的每条发言都回一遍。
 
-> **两层过滤不要叠加过狠。** 判断器本身已经在做「该不该说」的取舍，`reply_probability`
-> 只是额外的节奏调节。设成 `0.35` 等于把判断器认可的消息再砍掉 65%，观感就是
-> 「不 @ 它就不说话」。想要自然插话，用 `1.0` 把决定权交给判断器，再用冷却控制频率。
+> **两层过滤的默认值偏保守。** 实例配置里 `reply_probability: 0.2`、`min_interest: 0.55`，
+> 也就是“不 @ 时大部分时间保持安静”。想更爱接话就把 `reply_probability` 回调到
+> `0.4~0.6`、`min_interest` 降到 `0.4`，不要一次拉满。
 
 ### 为什么「A 能一直聊，B 插不上话」
 
@@ -243,10 +258,19 @@ reply:
   continuation_user_cooldown_seconds: 1
   retry_on_cooldown: true          # 被冷却挡下的消息延后重判一次
   max_cooldown_retry_seconds: 15   # 超过这个等待时间就不再重试
+  split_replies: true              # 长回复拆成 2~3 条分开发
+  split_min_chars: 160
+  split_max_parts: 3
+  split_probability: 0.8
+  split_gap_min_seconds: 0.8
+  split_gap_max_seconds: 3.0
 
 participation:
   enabled: true
-  reply_probability: 1.0
+  reply_probability: 0.2           # 不是 @ 时，判断通过后也只有 20% 会回
+  min_interest: 0.55               # 低于这个兴趣分就不回
+  topic_window_seconds: 120        # 刚回过的话题，这 120 秒内限流
+  topic_window_reply_probability: 0.15
   ignore_other_mentions: true
   max_context_messages: 15
   timeout_seconds: 30
@@ -254,8 +278,17 @@ participation:
 ```
 
 - `continuation_window_seconds`：Bot 回复某个用户后，该用户继续说话的时间窗口。窗口内使用更短冷却，并跳过参与判断和概率，避免对话断掉。
-- 普通闲聊的 `reply_probability` 只影响“判断通过后的普通消息”，不影响直接 @。`1.0` = 完全交给判断器；
-  想更安静就下调到 `0.5~0.8`，不建议低于 `0.5`（会明显显得不理人）。
+- `reply_probability`：只影响“判断通过后的普通消息”，不影响直接 @。
+- `min_interest`：判断器返回的 0~1 兴趣分低于它就沉默。比单纯调概率更精准，
+  因为“不感兴趣”和“感兴趣但现在不说”是两件事。
+- `topic_window_seconds` / `topic_window_reply_probability`：话题级限流。回复后窗口内
+  其他人的消息（不带 @、也不是接着跟 Bot 说话）只会以这个低概率进入回复，
+  所以一群人聊同一个话题只会得到一次回应。`topic_window_seconds: 0` 关闭。
+- `split_replies` 一组：**分条位置优先由模型自己决定**——提示词要求它在自然断点处写
+  `<split/>`（最多两个，不能出现在开头/结尾）。模型没写标记时，才回退到按句子边界启发式拆分：
+  超过 `split_min_chars` 的回复拆成最多 `split_max_parts` 条，条间停顿 `split_gap_min/max_seconds`，
+  并有 `split_probability` 的概率才拆。标记会在发送前剥掉，不会漏进消息；
+  超长截断时切到标记中间也会被清理。
 - 冷却命中时消息会被**跳过**，不会排队延迟发送。
 - Bot 自己发送的文本会加入短期上下文并标记为 `[you]`，但不会再次触发回复。
 
@@ -263,8 +296,11 @@ participation:
 
 | 想要的效果 | 调整 |
 | --- | --- |
-| 更爱接话 | `reply_probability: 1.0`，`channel_cooldown_seconds` 调到 `3` |
-| 更安静 | `reply_probability: 0.6~0.8`，冷却调到 `20~30` |
+| 更爱接话 | `reply_probability: 0.4~0.6`，`min_interest` 降到 `0.4`，冷却调到 `3` |
+| 更安静 | `reply_probability: 0.1~0.2`，`min_interest` 提到 `0.6`，冷却调到 `20~30` |
+| 同一话题不要回好几次 | 调大 `topic_window_seconds`（如 `180`），调小 `topic_window_reply_probability` |
+| 回复不要像一大段说明文 | 保持 `split_replies: true`，把 `split_min_chars` 降到 `120` |
+| 操作节奏太规律 | 调大 `poll_jitter_ratio`、`send_delay_jitter_seconds`，开启 `poll_burst_size` 停顿 |
 | 别人互相 @ 时也想插话 | `ignore_other_mentions: false`（交由判断器决定，仍会拒绝「文件发我」这类私事） |
 | 聊起来后不要断 | 保持 `continuation_window_seconds: 180`（默认配置） |
 | 完全不主动 | `participation.enabled: false`（只在 @ 时回复） |

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import re
 import threading
 import time
@@ -27,6 +28,7 @@ from typing import Any, Awaitable, Callable
 from app.config import WeChatChatConfig, WeChatConfig
 from app.context_manager import IncomingMessage
 from app.errors import ConfigurationError
+from app.humanize import gap_seconds, jittered_seconds, typing_delay_seconds
 from app.logging_setup import restore_logging, snapshot_logging
 from app.wechat_env import WeChatEnvironment, check_environment
 
@@ -147,11 +149,13 @@ class WxAutoAdapter:
         handler: MessageHandler,
         client_factory: Callable[[], Any] | None = None,
         logger_: logging.Logger | None = None,
+        random_fn: Callable[[], float] | None = None,
     ) -> None:
         self.config = config
         self.handler = handler
         self.logger = logger_ or logger
         self._client_factory = client_factory
+        self._random = random_fn or random.random
         self.wx: Any | None = None
         self.bot_name = (config.bot_name or "").strip()
         self.environment: WeChatEnvironment | None = None
@@ -273,10 +277,33 @@ class WxAutoAdapter:
         self._sweep_stale_images()
         self._init_client()
         self._running = True
+        polls = 0
         try:
             while self._running:
                 await self.poll_once()
-                await asyncio.sleep(self.config.poll_interval_seconds)
+                polls += 1
+                # A desktop client driven by a person is not metronomic: the
+                # cadence drifts, and after a while the window sits untouched.
+                if (
+                    self.config.poll_burst_size > 0
+                    and polls >= self.config.poll_burst_size
+                    and self.config.poll_pause_max_seconds > 0
+                ):
+                    polls = 0
+                    pause = gap_seconds(
+                        self.config.poll_pause_min_seconds,
+                        self.config.poll_pause_max_seconds,
+                        rand=self._random,
+                    )
+                    self.logger.debug("wxauto4_poll_pause seconds=%.1f", pause)
+                    await asyncio.sleep(pause)
+                await asyncio.sleep(
+                    jittered_seconds(
+                        self.config.poll_interval_seconds,
+                        self.config.poll_jitter_ratio,
+                        rand=self._random,
+                    )
+                )
         finally:
             self._running = False
 
@@ -764,9 +791,37 @@ class WxAutoAdapter:
         text = (text or "").strip()
         if not text:
             return False
+        # Simulated reading/typing time, proportional to length plus jitter, so
+        # replies never appear the instant a message arrives.
+        delay = typing_delay_seconds(
+            text,
+            base_seconds=self.config.send_delay_seconds,
+            per_char_seconds=self.config.send_delay_per_char_seconds,
+            jitter_seconds=self.config.send_delay_jitter_seconds,
+            max_seconds=self.config.send_delay_max_seconds,
+            rand=self._random,
+        )
+        if delay > 0:
+            self.logger.debug(
+                "wxauto4_typing chat=%s chars=%d delay=%.1fs",
+                chat.name,
+                len(text),
+                delay,
+            )
+            await asyncio.sleep(delay)
         sent = await asyncio.to_thread(self._send_blocking, chat.name, text)
-        if sent and self.config.send_delay_seconds > 0:
-            await asyncio.sleep(self.config.send_delay_seconds)
+        if (
+            sent
+            and self.config.send_delay_seconds > 0
+            and self.config.send_gap_seconds > 0
+        ):
+            await asyncio.sleep(
+                gap_seconds(
+                    self.config.send_gap_seconds * 0.5,
+                    self.config.send_gap_seconds,
+                    rand=self._random,
+                )
+            )
         return sent
 
     def _send_blocking(self, chat_name: str, text: str) -> bool:
