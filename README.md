@@ -339,6 +339,23 @@ web_search:
 
 ---
 
+### 日期与时间（模型没有内置时钟）
+
+模型本身不知道「今天」是哪天。所以每次请求都会拼一行实时时钟给 Agent（和参与判断）：
+
+```text
+Current date and time: 2026-10-31 01:21（周六，UTC+09:00）；
+今天 2026-10-31（周六），明天 2026-11-01（周日），昨天 2026-10-30（周五）
+```
+
+- 用的是**本机本地时区**（`datetime.now().astimezone()`），所以要保证 Windows 时区设置正确。
+- 相对日期（今天/明天/昨天）由 Python 算好直接给，避免模型自己做日期加减或从搜索结果里
+  抓一个日期当成"今天"。
+- 提示词里明确要求：**不许说"我不知道今天几号"**，也不许把聊天记录/记忆/搜索里的日期当成当前日期。
+- 时钟只在运行时拼进请求，不写进数据库，也不影响人设文件。
+
+---
+
 ## 8. 数据与记忆
 
 默认数据库：`./data/bot.db`。
@@ -424,7 +441,7 @@ Copy-Item data\bot.db data\bot.db.backup
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-当前测试结果：**149 passed, 6 skipped**。
+当前测试结果：**154 passed, 6 skipped**。
 
 测试使用临时 SQLite、Fake Chat Model、Fake Agent/Sender，以及假的 wxauto4 客户端；
 不会访问真实微信或 DeepSeek API。
