@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +17,7 @@ from app.errors import ConfigurationError
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
 _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -92,6 +93,29 @@ class WeChatConfig(StrictModel):
     image_cache_size: int = Field(default=10, ge=0, le=50)
     # How many cached images to attach to one follow-up message.
     image_followup_max_images: int = Field(default=3, ge=1, le=6)
+    # Local-time window in which the bot may send replies. Outside it the
+    # client keeps reading (so context stays fresh) but never sends anything,
+    # like a person who is asleep. ``start > end`` wraps past midnight.
+    # Set both to null to stay reachable around the clock.
+    active_hours_start: str | None = Field(default=None, max_length=5)
+    active_hours_end: str | None = Field(default=None, max_length=5)
+
+    @field_validator("active_hours_start", "active_hours_end")
+    @classmethod
+    def _valid_clock(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _CLOCK_RE.match(value):
+            raise ValueError("active_hours must use 24-hour HH:MM format")
+        return value
+
+    @model_validator(mode="after")
+    def _active_hours_paired(self) -> "WeChatConfig":
+        if (self.active_hours_start is None) != (self.active_hours_end is None):
+            raise ValueError(
+                "set both active_hours_start and active_hours_end, or neither"
+            )
+        return self
 
     @field_validator("chats")
     @classmethod
@@ -360,3 +384,46 @@ def load_dotenv_if_present(project_root: Path | None = None) -> None:
     from dotenv import load_dotenv
 
     load_dotenv((project_root or default_project_root()) / ".env", override=False)
+
+
+def effective_config(loaded: LoadedInstance) -> dict[str, Any]:
+    """Every effective setting: instance YAML merged over the code defaults."""
+
+    data = loaded.config.model_dump(mode="json")
+    data["_resolved"] = {
+        "instance_config": str(loaded.config_path),
+        "persona_file": str(loaded.persona.path),
+        "database_path": str(loaded.database_path),
+    }
+    return data
+
+
+def config_overrides(loaded: LoadedInstance) -> dict[str, Any]:
+    """Leaf settings whose effective value differs from the code default."""
+
+    return _diff_leaves(
+        _default_instance_dump(),
+        loaded.config.model_dump(mode="json"),
+    )
+
+
+def _default_instance_dump() -> dict[str, Any]:
+    return InstanceConfig(
+        instance_id="default",
+        persona_id="default",
+        wechat=WeChatConfig(chats=[WeChatChatConfig(name="default")]),
+    ).model_dump(mode="json")
+
+
+def _diff_leaves(
+    defaults: dict[str, Any], current: dict[str, Any], prefix: str = ""
+) -> dict[str, Any]:
+    differences: dict[str, Any] = {}
+    for key, value in current.items():
+        path = f"{prefix}{key}"
+        baseline = defaults.get(key)
+        if isinstance(value, dict) and isinstance(baseline, dict):
+            differences.update(_diff_leaves(baseline, value, f"{path}."))
+        elif value != baseline:
+            differences[path] = value
+    return differences

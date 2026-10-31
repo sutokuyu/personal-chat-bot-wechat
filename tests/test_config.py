@@ -17,10 +17,16 @@ from app.tools.registry import validate_tool_names
 PERSONA = "# Persona\n\nA sufficiently long test persona prompt for validation."
 
 
-def _write_tree(tmp_path: Path, *, instance_id: str = "test", overrides: str = "") -> Path:
+def _write_tree(
+    tmp_path: Path,
+    *,
+    instance_id: str = "test",
+    overrides: str = "",
+    wechat_extra: str = "",
+) -> Path:
     config_dir = tmp_path / "config"
-    (config_dir / "instances").mkdir(parents=True)
-    (config_dir / "personas").mkdir(parents=True)
+    (config_dir / "instances").mkdir(parents=True, exist_ok=True)
+    (config_dir / "personas").mkdir(parents=True, exist_ok=True)
     (config_dir / "personas" / f"{instance_id}.md").write_text(PERSONA, encoding="utf-8")
     (config_dir / "instances" / f"{instance_id}.yaml").write_text(
         f"""
@@ -32,7 +38,7 @@ wechat:
   chats:
     - name: "文件传输助手"
       kind: direct
-model:
+{wechat_extra}model:
   model_name: deepseek-chat
 {overrides}
 """,
@@ -125,6 +131,21 @@ def test_tool_registry_rejects_unknown_names(tmp_path):
     )
     with pytest.raises(ConfigurationError, match="memory is disabled"):
         validate_tool_names(disabled_memory)
+
+
+def test_active_hours_must_be_a_valid_pair(tmp_path):
+    config_dir = _write_tree(
+        tmp_path,
+        wechat_extra="  active_hours_start: '8:00'\n  active_hours_end: '01:00'\n",
+    )
+    with pytest.raises(ConfigurationError, match="HH:MM"):
+        load_instance("test", config_dir=config_dir, project_root=tmp_path)
+
+    config_dir = _write_tree(
+        tmp_path, wechat_extra="  active_hours_start: '08:00'\n"
+    )
+    with pytest.raises(ConfigurationError, match="or neither"):
+        load_instance("test", config_dir=config_dir, project_root=tmp_path)
 
 
 def test_reasoner_model_is_refused_for_tool_calling():

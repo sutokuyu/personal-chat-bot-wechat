@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from langchain_core.messages import AIMessage
 
@@ -15,6 +16,7 @@ from app.participation_gate import (
     ParticipationGate,
 )
 from app.runtime import BotRuntime, create_runtime
+from app.wxauto_adapter import chat_id_for, stable_id
 from tests.conftest import (
     FakeAgentRunner,
     FakeExtractionRunner,
@@ -186,6 +188,132 @@ async def test_runtime_replies_and_stores_self_reply(tmp_path):
     assert any(item.is_self for item in history)
     assert [item.message_id for item in history if not item.is_self] == [20]
     await runtime.close()
+
+
+async def test_runtime_restores_recent_user_and_bot_messages_after_restart(tmp_path):
+    loaded = make_loaded("deepseek-chan")
+    reply = ReplyConfig(
+        channel_cooldown_seconds=0,
+        user_cooldown_seconds=0,
+        continuation_window_seconds=0,
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"reply": reply})}
+    )
+    database = make_database(tmp_path)
+    account_id = loaded.config.wechat.account_id
+    guild_id = stable_id("account", account_id)
+    channel_id = chat_id_for(account_id, loaded.config.wechat.chats[0].name)
+
+    first_runner = FakeAgentRunner(result=AgentResult(text="之前我们聊了旅行。"))
+    first = BotRuntime(
+        loaded,
+        agent_runner=first_runner,
+        sender=FakeSender(),
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=database,
+    )
+    await first.handle_message(
+        make_message(
+            80,
+            content="我们刚才聊到什么？",
+            guild_id=guild_id,
+            channel_id=channel_id,
+            is_mention=True,
+        )
+    )
+    await first.close()
+
+    second_runner = FakeAgentRunner()
+    second = BotRuntime(
+        loaded,
+        agent_runner=second_runner,
+        sender=FakeSender(),
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=database,
+    )
+    try:
+        restored = second.context.recent((guild_id, channel_id))
+        assert [item.content for item in restored] == [
+            "我们刚才聊到什么？",
+            "之前我们聊了旅行。",
+        ]
+        assert restored[-1].is_self
+
+        await second.handle_message(
+            make_message(
+                81,
+                content="那你建议去哪？",
+                guild_id=guild_id,
+                channel_id=channel_id,
+                is_mention=True,
+            )
+        )
+        agent_input = second_runner.calls[0][0]
+        assert "我们刚才聊到什么？" in agent_input
+        assert "之前我们聊了旅行。" in agent_input
+        assert "那你建议去哪？" in agent_input
+    finally:
+        await second.close()
+
+
+async def test_runtime_stays_silent_outside_active_hours(tmp_path):
+    loaded = make_loaded("deepseek-chan")
+    wechat = loaded.config.wechat.model_copy(
+        update={"active_hours_start": "08:00", "active_hours_end": "01:00"}
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"wechat": wechat})}
+    )
+    runner = FakeAgentRunner()
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=runner,
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+        now_fn=lambda: datetime(2026, 10, 31, 3, 30),
+    )
+    try:
+        await runtime.handle_message(
+            make_message(90, content="这么晚还没睡？", is_mention=True)
+        )
+        assert sender.sent == []
+        assert runner.calls == [], "the agent must not run during silent hours"
+        assert [item.message_id for item in runtime.context.recent((100, 200))] == [90]
+    finally:
+        await runtime.close()
+
+
+async def test_runtime_answers_inside_active_hours(tmp_path):
+    loaded = make_loaded("deepseek-chan")
+    wechat = loaded.config.wechat.model_copy(
+        update={"active_hours_start": "08:00", "active_hours_end": "01:00"}
+    )
+    loaded = loaded.model_copy(
+        update={"config": loaded.config.model_copy(update={"wechat": wechat})}
+    )
+    sender = FakeSender()
+    runtime = BotRuntime(
+        loaded,
+        agent_runner=FakeAgentRunner(),
+        sender=sender,
+        judge=FakeJudge(),
+        extraction_runner=FakeExtractionRunner(),
+        database=make_database(tmp_path),
+        now_fn=lambda: datetime(2026, 10, 31, 12, 0),
+    )
+    try:
+        await runtime.handle_message(
+            make_message(91, content="中午吃啥？", is_mention=True)
+        )
+        assert len(sender.sent) == 1
+    finally:
+        await runtime.close()
 
 
 async def test_runtime_agent_failure_is_controlled(tmp_path):

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS user_profiles (
@@ -124,10 +124,32 @@ CREATE INDEX IF NOT EXISTS ix_pending_messages_channel
     ON pending_messages (guild_id, channel_id, message_id);
 """
 
+_MIGRATION_4 = """
+-- Bounded short-term conversation history, including the bot's own replies.
+CREATE TABLE IF NOT EXISTS conversation_history (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    author_name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    is_mention INTEGER NOT NULL DEFAULT 0,
+    mentions_other INTEGER NOT NULL DEFAULT 0,
+    is_bot INTEGER NOT NULL DEFAULT 0,
+    is_self INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, channel_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_conversation_history_order
+    ON conversation_history (guild_id, channel_id, created_at, message_id);
+"""
+
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
     (3, _MIGRATION_3),
+    (4, _MIGRATION_4),
 )
 
 def get_schema_version(conn: sqlite3.Connection) -> int:

@@ -42,6 +42,8 @@ from app.participation_gate import (
     ParticipationGate,
     ParticipationJudge,
 )
+from app.schedule import is_within_window, resolve_window
+from app.storage.conversation_history import ConversationHistoryStore
 from app.storage.database import Database
 from app.storage.pending_messages import PendingMessageStore
 from app.tools.context import AgentRuntimeContext
@@ -102,6 +104,7 @@ class BotRuntime:
         image_describer: ImageDescriber | None = None,
         logger_: logging.Logger | None = None,
         random_fn: Callable[[], float] | None = None,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.loaded = loaded
         self.config = loaded.config
@@ -111,6 +114,11 @@ class BotRuntime:
         self.agent_runner = agent_runner
         self.image_describer = image_describer
         self._random = random_fn or random.random
+        self._now = now_fn or (lambda: datetime.now().astimezone())
+        self._active_window = resolve_window(
+            self.config.wechat.active_hours_start,
+            self.config.wechat.active_hours_end,
+        )
         self.database = database or Database(loaded.database_path)
         self.database.initialize()
         self.policy = MemoryAccessPolicy(
@@ -118,6 +126,9 @@ class BotRuntime:
         )
         self.repository = MemoryRepository(self.database, self.policy)
         self.state = BotStateRepository(self.database)
+        self.history_store = ConversationHistoryStore(
+            self.database, max_per_channel=self.config.context.max_messages
+        )
         pending_store = (
             PendingMessageStore(
                 self.database,
@@ -131,9 +142,11 @@ class BotRuntime:
             max_messages=self.config.context.max_messages,
             track_extraction=self.config.memory.enabled,
             pending_store=pending_store,
+            history_store=self.history_store,
         )
-        if pending_store is not None:
-            self._restore_pending_messages()
+        if context_manager is not None:
+            self.context.history_store = self.history_store
+        self._restore_conversation_history()
         cooldowns = CooldownStore(self.state, self.config.instance_id)
         self.gate = ParticipationGate(
             instance_id=self.config.instance_id,
@@ -177,13 +190,25 @@ class BotRuntime:
     def set_sender(self, sender: ReplySender) -> None:
         self.sender = sender
 
-    def _restore_pending_messages(self) -> None:
-        """Reload messages a previous process had not extracted yet."""
+    def _restore_conversation_history(self) -> None:
+        """Reload recent conversation and any pending extraction work."""
 
         account_id = self.config.wechat.account_id
         guild_id = stable_id("account", account_id)
         for chat in self.config.wechat.chats:
             key = (guild_id, chat_id_for(account_id, chat.name))
+            history = self.history_store.load(key)
+            if not history and self.pending_store is not None:
+                history = self.pending_store.load(key)
+            restored_history = self.context.hydrate_history(key, history)
+            if restored_history:
+                self.logger.info(
+                    "conversation_history_restored chat=%s messages=%d",
+                    chat.name,
+                    restored_history,
+                )
+            if self.pending_store is None:
+                continue
             cursor = self.state.get_extraction_cursor(
                 self.config.instance_id, str(key[1])
             )
@@ -197,6 +222,13 @@ class BotRuntime:
                     chat.name,
                     restored,
                 )
+
+    def _is_awake(self, now: datetime | None = None) -> bool:
+        """False outside the configured active window; such messages just wait."""
+
+        if self._active_window is None:
+            return True
+        return is_within_window(now or self._now(), *self._active_window)
 
     def _lock_for(self, key: tuple[int, int]) -> asyncio.Lock:
         lock = self._channel_locks.get(key)
@@ -444,6 +476,16 @@ class BotRuntime:
     async def _handle_message_locked(
         self, message: IncomingMessage, *, reprocess: bool = False
     ) -> None:
+        if not self._is_awake():
+            # Silent hours: the message stays in history, so it is visible in the
+            # transcript once the bot is awake again.
+            self.logger.debug(
+                "message_skipped_dormant channel=%s message=%s",
+                message.channel_id,
+                message.message_id,
+            )
+            return
+
         # Snowflake ids sort chronologically; ignore messages that arrived while
         # this one was waiting for the per-channel lock.
         recent = [

@@ -30,6 +30,10 @@ class PendingStore(Protocol):
     def discard(self, key: ChannelKey, message_ids: list[int]) -> None: ...
 
 
+class HistoryStore(Protocol):
+    def append(self, message: "IncomingMessage") -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class IncomingMessage:
     message_id: int
@@ -67,10 +71,12 @@ class ContextManager:
         seen_limit: int = 4000,
         track_extraction: bool = True,
         pending_store: "PendingStore | None" = None,
+        history_store: "HistoryStore | None" = None,
     ) -> None:
         self.max_messages = max_messages
         self.track_extraction = track_extraction
         self.pending_store = pending_store
+        self.history_store = history_store
         self._channels: dict[ChannelKey, ChannelContext] = {}
         self._seen_order: Deque[int] = deque()
         self._seen: set[int] = set()
@@ -113,6 +119,8 @@ class ContextManager:
             # Persisted so a restart does not discard progress towards the
             # extraction threshold.
             store.append(message)
+        if self.history_store is not None:
+            self.history_store.append(message)
 
     def add_bot_reply(
         self,
@@ -145,7 +153,35 @@ class ContextManager:
                 is_self=True,
             )
             self._channel(message.key).history.append(message)
-            return message
+            history_store = self.history_store
+        if history_store is not None:
+            history_store.append(message)
+        return message
+
+    def hydrate_history(
+        self, key: ChannelKey, messages: Iterable[IncomingMessage]
+    ) -> int:
+        """Restore recent conversation messages without adding them to extraction."""
+
+        with self._lock:
+            channel = self._channel(key)
+            known = {item.message_id for item in channel.history}
+            merged = list(channel.history)
+            loaded = 0
+            for message in messages:
+                if message.key != key or message.message_id in known:
+                    continue
+                known.add(message.message_id)
+                merged.append(message)
+                loaded += 1
+                if message.is_self:
+                    self._next_synthetic_id = min(
+                        self._next_synthetic_id, message.message_id - 1
+                    )
+            merged.sort(key=lambda item: (item.created_at, item.message_id))
+            channel.history.clear()
+            channel.history.extend(merged[-self.max_messages :])
+        return loaded
 
     def recent(self, key: ChannelKey) -> list[IncomingMessage]:
         with self._lock:

@@ -82,6 +82,10 @@ DEEPSEEK_API_KEY=sk-...
 
 ## 4. 配置监听的微信聊天
 
+> 全部可调项（各节字段的默认值/现值/取值范围、代码内常量、环境变量、CLI 参数）汇总在
+> [`docs/configuration.md`](docs/configuration.md)。想直接看当前生效值用
+> `python -m app --show-config`。
+
 编辑 `config/instances/deepseek-chan.yaml` 的 `wechat` 部分：
 
 ```yaml
@@ -96,16 +100,18 @@ wechat:
       # 可选：只给这个群改图片缓存张数
       # image_cache_size: 20
 
-  poll_interval_seconds: 1.0
-  poll_jitter_ratio: 0.35          # 每次轮询 ±35% 随机抖动
-  poll_burst_size: 30              # 轮询这么多次后“离开一会儿”
-  poll_pause_min_seconds: 10
-  poll_pause_max_seconds: 45
+  poll_interval_seconds: 20.0
+  poll_jitter_ratio: 0.5           # 每次轮询 ±50% 随机抖动
+  poll_burst_size: 12              # 轮询这么多次后“离开一会儿”
+  poll_pause_min_seconds: 90
+  poll_pause_max_seconds: 300
   send_delay_seconds: 1.0          # 发送前的基准“读+打字”延时，0 = 关闭整套延时
-  send_delay_per_char_seconds: 0.05  # 每字追加的延时
+  send_delay_per_char_seconds: 0.3   # 每字追加的延时（≈3.3 字/秒）
   send_delay_jitter_seconds: 1.5   # 额外随机犹豫时间
-  send_delay_max_seconds: 25
-  send_gap_seconds: 0.6            # 一条发完后的小停顿
+  send_delay_max_seconds: 60
+  send_gap_seconds: 2.0            # 一条发完后的小停顿
+  active_hours_start: "08:00"      # 作息窗口：窗口外不发消息，两边都写 null 表示全天在线
+  active_hours_end: "01:00"        # start > end 表示跨午夜
   bot_name: null
   text_only: true
   capture_images: true          # 看图（见下）
@@ -120,12 +126,20 @@ wechat:
 - `kind: direct`：私聊。每条消息都视为直接对 Bot 说，优先回复；仍受冷却和延续窗口控制。
 - `kind: group`：群聊。只有内容中出现 `@Bot昵称` 时才作为直接提及；其他消息走参与判断和回复概率。
 - `bot_name`：可选。省略时使用当前登录微信账号的昵称。群聊 @ 检测依赖它。\n  如果你在群里的昵称/群备注与账号昵称不同，请显式填写群里显示的名字。
-- `poll_interval_seconds`：轮询间隔（秒），建议 1 秒。配置了 N 个聊天时，每轮会依次切换这 N 个窗口。
+- `poll_interval_seconds`：轮询间隔（秒）。示例实例用 20 秒：回复延迟落在几十秒这个人类区间，
+  又不会因为太密集而显得一直盯着屏幕。配置了 N 个聊天时，每轮会依次切换这 N 个窗口。
   `poll_jitter_ratio` 会给每次间隔加随机抖动；每 `poll_burst_size` 轮再随机停
   `poll_pause_min/max_seconds`，避免窗口切换精确得像机器。
 - `send_delay_seconds`：发送前的“读消息 + 打字”基准延时；实际延时 =
   `send_delay_seconds + send_delay_per_char_seconds × 字数 + 随机抖动`，上限
   `send_delay_max_seconds`。设成 `0` 会关闭整套延时（含每字耗时与抖动）。
+  `send_delay_max_seconds` 不要设得太小：一旦撞到上限，再长的消息也会用同样的时间发完，
+  等于“字数越多打字越快”。长回复应该靠分条，而不是靠压短延时。
+- `active_hours_start` / `active_hours_end`：作息窗口，用本机时区的 24 小时制 `HH:MM`。
+  窗口外仍然轮询、仍然记录上下文，但**不会发出任何消息**，就像人睡着了；
+  醒来后这些消息还在上下文里，可以正常接着聊。`start > end` 表示跨午夜
+  （`"08:00"` → `"01:00"` = 凌晨 1 点到早上 8 点不说话）。
+  两边都写 `null` 表示全天在线；只写一边会直接报配置错误。
 - `text_only: true`：只处理文本，跳过文件、语音、链接等消息。
 - `capture_images: true`：处理图片消息（`text_only` 不影响图片开关）。每张图会：
   1. 在切换聊天前立刻保存下来（wxauto4 的消息控件一旦重绘就失效）；
@@ -153,8 +167,8 @@ wechat:
 
   **重要限制**：wxauto4 只能读到微信**当前渲染出来**的消息（大约几行）。图片很占高度，
   一张大图就可能占满可见区域，所以「连着发 3 张图」时，只有恰好被轮询看到的那几张能进缓存。
-  想提高命中率：减少同时监听的聊天数、把 `poll_interval_seconds` 调小（如 `0.5`）、
-  让微信窗口尽量大。日志里 `wxauto4_poll ... rendered=N` 就是每轮实际读到的行数。
+  想提高命中率：减少同时监听的聊天数、把 `poll_interval_seconds` 调小（如 `5`）、
+  让微信窗口尽量大。注意调小轮询间隔会让回复来得更快、更规律，和“像真人”是相反的取舍。日志里 `wxauto4_poll ... rendered=N` 就是每轮实际读到的行数。
 
 启动前请先登录 PC 微信 4.1.x，并把微信主窗口切到**当前桌面、放在最前面**，保持桌面会话可用。
 wxauto4 基于 UI 自动化，初始化要点头像读资料、轮询要点聊天列表，锁屏、退出到托盘、
@@ -200,11 +214,18 @@ wxauto4_image_unavailable chat=... sender=...     # 图片没拿到（会回给�
 wxauto4_sent chat=小窝儿 🎵 🎵 🎵 chars=42        # 实际发到了哪个聊天（排查串群）
 ```
 
-查看实例：
+查看实例，以及查看**当前真正生效的全部配置**（实例 YAML + 代码默认值合并后）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m app --list-instances
+.\.venv\Scripts\python.exe -m app --show-config
 ```
+
+`--show-config` 会打印完整配置，末尾再列出「与代码默认值不同的项」，所以不用再翻
+YAML、`app/config.py` 和散落在模块里的常量。
+
+> 所有可调项（含代码内常量、环境变量、CLI 参数）的汇总表在
+> [`docs/configuration.md`](docs/configuration.md)。
 
 ---
 
@@ -239,8 +260,8 @@ wxauto4_sent chat=小窝儿 🎵 🎵 🎵 chars=42        # 实际发到了哪�
 1. **延续窗口按用户算**：bot 回过 A 之后 `continuation_window_seconds` 内，A 的消息直接放行
    （`forced=True`），不经过判断器和概率。
 2. **频道冷却是整个聊天共享的**：每次回复都会刷新频道时间戳。A 的延续回复只等
-   `continuation_channel_cooldown_seconds`（2 秒），而 B 不是延续用户，要等
-   `channel_cooldown_seconds`（5 秒）。A 聊得越密，B 的窗口越窄。
+   `continuation_channel_cooldown_seconds`（12 秒），而 B 不是延续用户，要等
+   `channel_cooldown_seconds`（45 秒）。A 聊得越密，B 的窗口越窄。
 3. **冷却命中的消息只延后重判一次**（`retry_on_cooldown: true`）：到点后用
    `reprocess` 重新判断，判断器认可就回复；旧版本是直接永久丢弃，所以 B 会「永远没反应」。
 
@@ -251,13 +272,13 @@ wxauto4_sent chat=小窝儿 🎵 🎵 🎵 chars=42        # 实际发到了哪�
 
 ```yaml
 reply:
-  channel_cooldown_seconds: 5
-  user_cooldown_seconds: 3
+  channel_cooldown_seconds: 45
+  user_cooldown_seconds: 25
   continuation_window_seconds: 180
-  continuation_channel_cooldown_seconds: 2
-  continuation_user_cooldown_seconds: 1
+  continuation_channel_cooldown_seconds: 12
+  continuation_user_cooldown_seconds: 8
   retry_on_cooldown: true          # 被冷却挡下的消息延后重判一次
-  max_cooldown_retry_seconds: 15   # 超过这个等待时间就不再重试
+  max_cooldown_retry_seconds: 8    # 超过这个等待时间就不再重试
   split_replies: true              # 长回复拆成 2~3 条分开发
   split_min_chars: 160
   split_max_parts: 3
@@ -296,8 +317,10 @@ participation:
 
 | 想要的效果 | 调整 |
 | --- | --- |
-| 更爱接话 | `reply_probability: 0.4~0.6`，`min_interest` 降到 `0.4`，冷却调到 `3` |
-| 更安静 | `reply_probability: 0.1~0.2`，`min_interest` 提到 `0.6`，冷却调到 `20~30` |
+| 更爱接话 | `reply_probability: 0.4~0.6`，`min_interest` 降到 `0.4`，冷却降到 `15~20` |
+| 更安静 | `reply_probability: 0.1~0.2`，`min_interest` 提到 `0.6`，冷却调到 `60~120` |
+| 不要半夜回消息 | 配好 `active_hours_start` / `active_hours_end`（示例实例是 08:00–01:00；都不配则全天在线） |
+| 回复不要出现“等间隔” | 别把 `max_cooldown_retry_seconds` 设得和冷却一样长，宁可让某些消息真的漏掉 |
 | 同一话题不要回好几次 | 调大 `topic_window_seconds`（如 `180`），调小 `topic_window_reply_probability` |
 | 回复不要像一大段说明文 | 保持 `split_replies: true`，把 `split_min_chars` 降到 `120` |
 | 操作节奏太规律 | 调大 `poll_jitter_ratio`、`send_delay_jitter_seconds`，开启 `poll_burst_size` 停顿 |
@@ -412,7 +435,7 @@ Current date and time: 2026-10-31 01:21（周六，UTC+09:00）；
 （schema v2 起；旧数据已按 `bot_state` 里的回复记录回填）。
 
 默认只保存长期记忆和 `user_profiles` / `bot_state`，不永久保存全部原始聊天文本。
-短期对话上下文只存在内存中，进程重启会清空。
+短期对话上下文会按聊天保存在 SQLite 中，进程重启后恢复最近的 `context.max_messages` 条消息；Bot 自己已发送的回复也会恢复并标记为 `[you]`。历史记录数量有上限，旧消息会自动淘汰。升级前只有仍在 `pending_messages` 中、尚未提取的消息可用于首次回填；升级后会持续记录完整的短期对话。图片原文件和临时图片缓存不属于持久化上下文。
 
 **待抽取的消息会落盘**（`pending_messages` 表，schema v3 起）：以前这个队列只在内存里，
 重启就清零，所以经常攒不够 `extraction_threshold` 条、几乎不抽取。现在：

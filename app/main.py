@@ -9,8 +9,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 from app.config import (
+    LoadedInstance,
+    config_overrides,
     default_project_root,
+    effective_config,
     list_instances,
     load_dotenv_if_present,
     load_instance,
@@ -61,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="only log to the console",
     )
     parser.add_argument("--list-instances", action="store_true")
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="print every effective setting (instance YAML over code defaults) and exit",
+    )
     parser.add_argument(
         "--list-memories",
         action="store_true",
@@ -126,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("configuration error: %s", exc)
         return 2
 
+    if args.show_config:
+        return _show_config(loaded)
+
     if args.list_memories:
         return _list_memories(loaded, args)
 
@@ -144,6 +157,42 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.info("shutdown requested")
     return 0
+
+
+def _show_config(loaded: LoadedInstance) -> int:
+    """One place to read every setting that is actually in effect."""
+
+    overrides = config_overrides(loaded)
+    if hasattr(sys.stdout, "reconfigure"):
+        # The dump contains WeChat chat names, which may include emoji.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    write = _write_stdout
+    write("# effective configuration (instance YAML merged over app/config.py defaults)")
+    write(f"# instance config: {loaded.config_path}")
+    write(f"# persona file:    {loaded.persona.path}")
+    write(f"# database:        {loaded.database_path}")
+    write(
+        yaml.safe_dump(
+            effective_config(loaded), sort_keys=False, allow_unicode=True
+        ).rstrip()
+    )
+    write("")
+    write("# settings that differ from the code defaults (everything else is default):")
+    if overrides:
+        write(yaml.safe_dump(overrides, sort_keys=True, allow_unicode=True).rstrip())
+    else:
+        write("# (none)")
+    return 0
+
+
+def _write_stdout(text: str) -> None:
+    """Chat names may contain emoji that legacy console code pages cannot encode."""
+
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(text.encode("utf-8", errors="replace") + b"\n")
+        sys.stdout.flush()
 
 
 def _list_memories(loaded, args) -> int:

@@ -20,20 +20,27 @@ wechat:
       # 可以单独给某个群设置图片缓存数量（不写就用下面的全局值）
       # image_cache_size: 20
 
-  poll_interval_seconds: 1.0
-  # 轮询节奏抖动：窗口切换不要精确到毫秒，±35% 随机。
-  poll_jitter_ratio: 0.35
-  # 每轮询这么多次“离开一会儿”，模拟人不在电脑前。
-  poll_burst_size: 30
-  poll_pause_min_seconds: 10
-  poll_pause_max_seconds: 45
+  poll_interval_seconds: 20.0
+  # 轮询节奏抖动：窗口切换不要精确到毫秒，±50% 随机。
+  poll_jitter_ratio: 0.5
+  # 每轮询这么多次“离开一会儿”，模拟人不在电脑前。12 轮 × 20 秒 ≈ 连续活动 4 分钟。
+  poll_burst_size: 12
+  # 离开的时长要明显长于“看一眼就走”的间隔，否则等于全天在线。
+  poll_pause_min_seconds: 90
+  poll_pause_max_seconds: 300
   # 发送前先“读+打字”的延时（秒）：基准 + 每字 + 随机抖动，0 = 关闭整套延时。
+  # 0.3 秒/字 ≈ 3.3 字/秒，接近真人，而不是 5 字/秒的“超人打字”。
   send_delay_seconds: 1.0
-  send_delay_per_char_seconds: 0.05
+  send_delay_per_char_seconds: 0.3
   send_delay_jitter_seconds: 1.5
-  send_delay_max_seconds: 25
+  # 上限要覆盖正常长度的回复；长回复靠拆成多条，而不是靠把打字时间压到 25 秒。
+  send_delay_max_seconds: 60
   # 一次发送完成后的小停顿。
-  send_gap_seconds: 0.6
+  send_gap_seconds: 2.0
+  # 作息窗口（本机时区）：窗口内才允许发消息，窗口外照常读取但保持沉默。
+  # start > end 表示跨午夜（例如 08:00 → 01:00）。两边都写 null 表示全天在线。
+  active_hours_start: "08:00"
+  active_hours_end: "01:00"
   # Optional. If omitted, the logged-in WeChat nickname is used for @ detection.
   bot_name: null
   text_only: true
@@ -89,20 +96,25 @@ memory:
 
 agent:
   max_tool_rounds: 3
-  timeout_seconds: 120
+  # 再长就是一段“毫无动静然后突然说话”的空白；真人的停顿不会一直被撑满。
+  timeout_seconds: 90
 
 reply:
   mention_priority: true
-  channel_cooldown_seconds: 5
-  user_cooldown_seconds: 3
+  # 冷却决定“能不能跟上别人的节奏”。5 秒能在群里一分钟答十几条，很不像人。
+  channel_cooldown_seconds: 45
+  user_cooldown_seconds: 25
   continuation_window_seconds: 180
-  continuation_channel_cooldown_seconds: 2
-  continuation_user_cooldown_seconds: 1
+  # 延续对话可以快，但 1~2 秒接话是人类打不出来的。
+  continuation_channel_cooldown_seconds: 12
+  continuation_user_cooldown_seconds: 8
   # 被冷却挡下的消息在冷却结束后再判断一次（只重试一次），
   # 避免某个人一直在聊，其他人插话时永远被冷却丢掉。
+  # 重试窗口不要太长，否则回复会以近似等间隔出现，反而更像机器。
   retry_on_cooldown: true
-  max_cooldown_retry_seconds: 15
-  max_reply_length: 1800
+  max_cooldown_retry_seconds: 8
+  # 微信里 1800 字是一堵墙；正常聊天单条很少超过几百字。
+  max_reply_length: 450
   # 长回复拆成 2~3 条分开发，中间随机停顿，像人打字后分句发。
   split_replies: true
   split_min_chars: 160

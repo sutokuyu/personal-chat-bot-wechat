@@ -134,7 +134,14 @@ def make_loaded(instance_id: str = "deepseek-chan"):
             "topic_window_seconds": 0.0,
         }
     )
-    config = loaded.config.model_copy(update={"participation": participation})
+    wechat = loaded.config.wechat.model_copy(
+        # Tests must not depend on the wall clock; the shipped instance sleeps
+        # between 01:00 and 08:00 and would silence a night-time test run.
+        update={"active_hours_start": None, "active_hours_end": None}
+    )
+    config = loaded.config.model_copy(
+        update={"participation": participation, "wechat": wechat}
+    )
     return loaded.model_copy(update={"config": config})
 
 
